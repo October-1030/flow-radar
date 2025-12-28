@@ -700,7 +700,14 @@ class CommandCenter:
         net_flow = self.whale_tracker.net_flow
         flow_color = "green" if net_flow > 0 else "red" if net_flow < 0 else "white"
         flow_sign = "+" if net_flow > 0 else ""
-        whale_line.append(f"净鲸流: {flow_sign}${net_flow:,.0f} ", style=flow_color)
+        whale_line.append(f"净鲸流: {flow_sign}${net_flow:,.0f}", style=flow_color)
+        # 计算占OI百分比
+        if self.open_interest and self.open_interest.open_interest_value > 0:
+            oi_value = self.open_interest.open_interest_value * self.current_price  # OI in USD
+            if oi_value > 0:
+                oi_pct = abs(net_flow) / oi_value * 100
+                whale_line.append(f" (占OI: {oi_pct:.2f}%)", style="cyan")
+        whale_line.append(" ")
         anchor = self.whale_tracker.physical_anchor
         if anchor:
             whale_line.append(f"| 物理锚点: ${anchor:.6f}", style="cyan")
