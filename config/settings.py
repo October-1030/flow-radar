@@ -37,10 +37,10 @@ CONFIG_MARKET = {
 # ==================== System I - 冰山单检测配置 ====================
 CONFIG_ICEBERG = {
     "detection_window": 60,                 # 检测窗口（秒）
-    "intensity_threshold": 5.0,             # 强度阈值
-    "min_cumulative_volume": 1000,          # 最小累计成交量（U）
+    "intensity_threshold": 2.0,             # 强度阈值（降低以更容易检测）
+    "min_cumulative_volume": 500,           # 最小累计成交量（U）
     "price_tolerance": 0.0001,              # 价格容差
-    "min_refill_count": 3,                  # 最小补单次数
+    "min_refill_count": 2,                  # 最小补单次数
     "log_path": str(LOG_DIR / "iceberg.log"),
 }
 

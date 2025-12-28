@@ -318,6 +318,13 @@ class IcebergDetector:
         stat_line.append(f"| 活跃: {stats['active_count']}", style="cyan")
         lines.append(stat_line)
 
+        # 实时监控数据
+        monitor_line = Text()
+        monitor_line.append(f"| 买盘层级: {len(self.bid_levels)} ", style="green")
+        monitor_line.append(f"| 卖盘层级: {len(self.ask_levels)} ", style="red")
+        monitor_line.append(f"| 成交追踪中...", style="dim")
+        lines.append(monitor_line)
+
         # 活跃冰山单列表
         if self.active_icebergs:
             lines.append(Text("\n活跃冰山单:", style="bold"))
