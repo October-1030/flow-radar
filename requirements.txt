@@ -1,0 +1,27 @@
+# Flow Radar - Dependencies
+# 流动性雷达 - 微观结构量化交易系统依赖
+
+# 核心依赖
+python-dateutil>=2.8.0
+numpy>=1.21.0
+pandas>=1.3.0
+
+# 交易所接口
+ccxt>=4.0.0
+
+# 异步支持
+aiohttp>=3.8.0
+websockets>=10.0
+
+# 终端美化
+rich>=12.0.0
+colorama>=0.4.4
+
+# 环境变量
+python-dotenv>=0.19.0
+
+# 数据库（可选）
+# sqlalchemy>=1.4.0
+
+# 技术指标（可选，需要额外安装）
+# ta-lib>=0.4.24
