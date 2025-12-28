@@ -30,7 +30,7 @@ CONFIG_MARKET = {
     "rsi_period": 14,                       # RSI 周期
     "atr_period": 14,                       # ATR 周期
     "log_path": str(LOG_DIR / "market.log"),
-    "exchange": "binance",                  # 交易所
+    "exchange": "okx",                      # 交易所
     "orderbook_depth": 20,                  # 订单簿深度
 }
 
