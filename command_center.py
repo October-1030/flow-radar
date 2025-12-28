@@ -38,6 +38,11 @@ from config.settings import (
     CONFIG_CHAIN, CONFIG_RISK, CONFIG_MTF, TIMEFRAME_SECONDS
 )
 from core.indicators import Indicators, IndicatorResult
+from core.derivatives import (
+    DerivativesDataFetcher, BinnedCVD, calculate_binned_cvd,
+    predict_liquidation_cascade, FundingRateData, OpenInterestData,
+    LongShortRatioData, LiquidationData
+)
 
 
 # 配置日志
@@ -117,6 +122,52 @@ class StrategicMap:
     data_source_status: str         # 数据源对齐状态
 
 
+@dataclass
+class WhaleFlowTracker:
+    """鲸鱼流量追踪"""
+    buy_volume: float = 0.0         # 鲸鱼买入量 (USD)
+    sell_volume: float = 0.0        # 鲸鱼卖出量 (USD)
+    buy_trades: List[Dict] = field(default_factory=list)   # 买入交易记录
+    sell_trades: List[Dict] = field(default_factory=list)  # 卖出交易记录
+
+    @property
+    def net_flow(self) -> float:
+        """净鲸流 = 买入 - 卖出"""
+        return self.buy_volume - self.sell_volume
+
+    @property
+    def physical_anchor(self) -> Optional[float]:
+        """物理锚点 = 鲸鱼成交的VWAP"""
+        all_trades = self.buy_trades + self.sell_trades
+        if not all_trades:
+            return None
+        total_value = sum(t['value'] for t in all_trades)
+        total_qty = sum(t['quantity'] for t in all_trades)
+        if total_qty == 0:
+            return None
+        return total_value / total_qty
+
+    def add_trade(self, price: float, quantity: float, value: float, is_buy: bool):
+        """添加鲸鱼交易"""
+        trade = {'price': price, 'quantity': quantity, 'value': value, 'timestamp': datetime.now()}
+        if is_buy:
+            self.buy_volume += value
+            self.buy_trades.append(trade)
+        else:
+            self.sell_volume += value
+            self.sell_trades.append(trade)
+
+    def cleanup(self, max_age_seconds: int = 3600):
+        """清理过期数据"""
+        now = datetime.now()
+        self.buy_trades = [t for t in self.buy_trades
+                          if (now - t['timestamp']).total_seconds() < max_age_seconds]
+        self.sell_trades = [t for t in self.sell_trades
+                           if (now - t['timestamp']).total_seconds() < max_age_seconds]
+        self.buy_volume = sum(t['value'] for t in self.buy_trades)
+        self.sell_volume = sum(t['value'] for t in self.sell_trades)
+
+
 class RefreshCountdown:
     """刷新倒计时"""
 
@@ -166,6 +217,25 @@ class CommandCenter:
         self.chain_state: str = "中性"
         self.extreme_state: str = ""
         self.current_pattern: str = ""
+        self.current_price: float = 0.0
+
+        # 鲸鱼流量追踪
+        self.whale_tracker = WhaleFlowTracker()
+
+        # 庄家演戏/战略洗盘状态
+        self.manipulation_alert: str = ""  # 庄家演戏警告
+        self.strategic_wash: str = ""      # 战略洗盘信号
+        self.market_score: int = 50        # 综合评分 0-100
+
+        # 合约数据
+        self.derivatives_fetcher = DerivativesDataFetcher(exchange=CONFIG_MARKET.get('exchange', 'okx'))
+        self.funding_rate: Optional[FundingRateData] = None
+        self.open_interest: Optional[OpenInterestData] = None
+        self.long_short_ratio: Optional[LongShortRatioData] = None
+        self.liquidation_data: Optional[LiquidationData] = None
+        self.binned_cvd: Optional[BinnedCVD] = None
+        self.liquidation_warning: str = ""
+        self.price_change_24h: float = 0.0
 
         # 执行环境
         self.execution_env = {
@@ -215,6 +285,27 @@ class CommandCenter:
             logger.error(f"获取市场数据失败: {e}")
             return None
 
+    async def fetch_derivatives_data(self):
+        """获取合约数据"""
+        try:
+            data = await self.derivatives_fetcher.fetch_all(self.symbol)
+            self.funding_rate = data.get("funding_rate")
+            self.open_interest = data.get("open_interest")
+            self.long_short_ratio = data.get("long_short_ratio")
+            self.liquidation_data = data.get("liquidations")
+
+            # 预测爆仓瀑布
+            risk_level, warning = predict_liquidation_cascade(
+                self.funding_rate,
+                self.open_interest,
+                self.long_short_ratio,
+                self.price_change_24h
+            )
+            self.liquidation_warning = warning
+
+        except Exception as e:
+            logger.debug(f"获取合约数据失败: {e}")
+
     async def update_mtf_trends(self):
         """更新多时间框架趋势"""
         tf_map = {"15M": "15m", "4H": "4h", "1D": "1d"}
@@ -247,12 +338,25 @@ class CommandCenter:
             trades=data['trades']
         )
         ind = self.current_indicators
+        self.current_price = data['ticker']['last']
+
+        # 清理过期鲸鱼数据
+        self.whale_tracker.cleanup(max_age_seconds=3600)
 
         # 检测大额交易
         for trade in data['trades']:
             value = trade['price'] * trade['quantity']
             if value >= CONFIG_MARKET['whale_threshold_usd']:
                 is_buy = not trade['is_buyer_maker']
+
+                # 记录鲸鱼交易
+                self.whale_tracker.add_trade(
+                    price=trade['price'],
+                    quantity=trade['quantity'],
+                    value=value,
+                    is_buy=is_buy
+                )
+
                 signals.append(SystemSignal(
                     source='M',
                     signal_type='WHALE_BUY' if is_buy else 'WHALE_SELL',
@@ -297,6 +401,13 @@ class CommandCenter:
 
         # 更新极端状态
         self.extreme_state = ind.extreme_state
+
+        # 计算分级CVD
+        self.binned_cvd = calculate_binned_cvd(data['trades'], data['ticker']['last'])
+
+        # 获取24h价格变化
+        if 'ticker' in data and 'percentage' in data['ticker']:
+            self.price_change_24h = data['ticker'].get('percentage', 0) or 0
 
         return signals
 
@@ -416,6 +527,106 @@ class CommandCenter:
 
         return ""
 
+    def detect_manipulation(self, data: Dict) -> str:
+        """检测庄家演戏 - 对倒诱多/诱空"""
+        if not self.current_indicators:
+            return ""
+
+        ind = self.current_indicators
+        whale_ratio = ind.whale_ratio if hasattr(ind, 'whale_ratio') else 0
+
+        # 对倒诱多检测条件:
+        # 1. 鲸鱼占比很高 (>50%)
+        # 2. OBI正值 (看似买方强)
+        # 3. 但价格斜率为负或很小 (价格不涨)
+        # 4. 大趋势为空
+        if whale_ratio > 50 and ind.obi > 0.3:
+            if ind.slope < 0.05 and self.mtf_trends['1D'] == "空":
+                return "诱多警告"
+
+        # 对倒诱空检测条件:
+        # 1. 鲸鱼占比很高
+        # 2. OBI负值 (看似卖方强)
+        # 3. 但价格斜率为正或很小 (价格不跌)
+        # 4. 大趋势为多
+        if whale_ratio > 50 and ind.obi < -0.3:
+            if ind.slope > -0.05 and self.mtf_trends['1D'] == "多":
+                return "诱空警告"
+
+        return ""
+
+    def detect_strategic_wash(self) -> Tuple[str, str]:
+        """检测战略洗盘"""
+        if not self.current_indicators:
+            return "", ""
+
+        ind = self.current_indicators
+        net_flow = self.whale_tracker.net_flow
+        anchor = self.whale_tracker.physical_anchor
+
+        # 战略洗盘条件:
+        # 1. 净鲸流为正 (大户在买)
+        # 2. 短期趋势为空 (价格在跌)
+        # 3. 价格接近物理锚点 (支撑位)
+        if net_flow > 10000:  # 净流入超过1万U
+            if self.mtf_trends['15M'] == "空" or self.mtf_trends['4H'] == "空":
+                if anchor and self.current_price > 0:
+                    distance_pct = abs(self.current_price - anchor) / self.current_price * 100
+                    if distance_pct < 3:  # 价格距离锚点3%以内
+                        message = "大户净流入为正, 回踩锚点支撑, 严禁恐慌抛售"
+                        return "STRATEGIC_WASH", message
+
+        # 反向洗盘 (诱空洗盘)
+        if net_flow < -10000:  # 净流出超过1万U
+            if self.mtf_trends['15M'] == "多" or self.mtf_trends['4H'] == "多":
+                if anchor and self.current_price > 0:
+                    distance_pct = abs(self.current_price - anchor) / self.current_price * 100
+                    if distance_pct < 3:
+                        message = "大户净流出, 反弹至锚点压力, 请勿追高"
+                        return "STRATEGIC_WASH_DOWN", message
+
+        return "", ""
+
+    def calculate_score(self) -> int:
+        """计算综合评分 0-100"""
+        if not self.current_indicators:
+            return 50
+
+        ind = self.current_indicators
+        score = 50  # 基础分
+
+        # MTF趋势加分
+        bullish_count = sum(1 for t in self.mtf_trends.values() if t == "多")
+        bearish_count = sum(1 for t in self.mtf_trends.values() if t == "空")
+        score += (bullish_count - bearish_count) * 10
+
+        # OBI加分
+        score += int(ind.obi * 20)
+
+        # 净鲸流加分
+        net_flow = self.whale_tracker.net_flow
+        if net_flow > 50000:
+            score += 15
+        elif net_flow > 20000:
+            score += 10
+        elif net_flow > 5000:
+            score += 5
+        elif net_flow < -50000:
+            score -= 15
+        elif net_flow < -20000:
+            score -= 10
+        elif net_flow < -5000:
+            score -= 5
+
+        # CVD加分
+        if ind.cvd > 5000:
+            score += 10
+        elif ind.cvd < -5000:
+            score -= 10
+
+        # 限制范围
+        return max(0, min(100, score))
+
     def build_display(self) -> Panel:
         """构建显示面板"""
         lines = []
@@ -440,14 +651,17 @@ class CommandCenter:
         map_line1.append("┌" + "─" * 70 + "┐")
         lines.append(map_line1)
 
-        # MTF趋势
+        # MTF趋势 + 分数
         mtf_line = Text()
         mtf_line.append("│ [战略地图] ")
         for tf, trend in self.mtf_trends.items():
             color = "green" if trend == "多" else "red" if trend == "空" else "yellow"
             mtf_line.append(f"{tf}: {trend} ", style=color)
             mtf_line.append("| ")
-        mtf_line.append(" " * (70 - len(str(mtf_line)) + 15) + "│")
+        # 添加分数显示
+        score_color = "green" if self.market_score >= 60 else "red" if self.market_score <= 40 else "yellow"
+        mtf_line.append(f"分数: {self.market_score} ", style=f"bold {score_color}")
+        mtf_line.append(" " * max(0, 70 - len(str(mtf_line)) + 15) + "│")
         lines.append(mtf_line)
 
         # 模式识别
@@ -461,6 +675,114 @@ class CommandCenter:
                 pattern_line.append(" 检测到低位吸筹, 请勿追空!", style="yellow")
             pattern_line.append(" " * max(0, 70 - len(str(pattern_line)) + 15) + "│")
             lines.append(pattern_line)
+
+        # 庄家演戏警告
+        if self.manipulation_alert:
+            manip_line = Text()
+            manip_line.append("│   ◉ ")
+            manip_line.append(f"【庄家演戏】{self.manipulation_alert}", style="bold red")
+            manip_line.append(" 检测到疑似对倒, 严禁入场!", style="yellow")
+            manip_line.append(" " * max(0, 70 - len(str(manip_line)) + 15) + "│")
+            lines.append(manip_line)
+
+        # 战略洗盘信号
+        if self.strategic_wash:
+            wash_line = Text()
+            wash_line.append("│   ◉ ")
+            wash_line.append(f"【战略洗盘】", style="bold cyan")
+            wash_line.append(f" {self.strategic_wash}", style="cyan")
+            wash_line.append(" " * max(0, 70 - len(str(wash_line)) + 15) + "│")
+            lines.append(wash_line)
+
+        # 鲸鱼流量
+        whale_line = Text()
+        whale_line.append("│ [鲸鱼流] ")
+        net_flow = self.whale_tracker.net_flow
+        flow_color = "green" if net_flow > 0 else "red" if net_flow < 0 else "white"
+        flow_sign = "+" if net_flow > 0 else ""
+        whale_line.append(f"净鲸流: {flow_sign}${net_flow:,.0f} ", style=flow_color)
+        anchor = self.whale_tracker.physical_anchor
+        if anchor:
+            whale_line.append(f"| 物理锚点: ${anchor:.6f}", style="cyan")
+        else:
+            whale_line.append("| 物理锚点: N/A", style="dim")
+        whale_line.append(" " * max(0, 70 - len(str(whale_line)) + 15) + "│")
+        lines.append(whale_line)
+
+        # 资金费率 + 多空比
+        if self.funding_rate or self.long_short_ratio:
+            deriv_line1 = Text()
+            deriv_line1.append("│ [合约] ")
+            if self.funding_rate:
+                rate = self.funding_rate.funding_rate * 100
+                rate_color = "red" if rate > 0.05 else "green" if rate < -0.05 else "yellow"
+                deriv_line1.append(f"费率: {rate:+.4f}% ", style=rate_color)
+                deriv_line1.append(f"({self.funding_rate.sentiment}) ", style=rate_color)
+            if self.long_short_ratio:
+                ls = self.long_short_ratio.long_short_ratio
+                ls_color = "red" if ls > 1.5 else "green" if ls < 0.67 else "yellow"
+                deriv_line1.append(f"| 多空比: {ls:.2f} ", style=ls_color)
+            deriv_line1.append(" " * max(0, 70 - len(str(deriv_line1)) + 15) + "│")
+            lines.append(deriv_line1)
+
+        # 持仓量 + 爆仓
+        if self.open_interest or self.liquidation_data:
+            deriv_line2 = Text()
+            deriv_line2.append("│ [杠杆] ")
+            if self.open_interest:
+                oi_val = self.open_interest.open_interest_value
+                if oi_val > 1000000:
+                    deriv_line2.append(f"OI: ${oi_val/1000000:.1f}M ", style="cyan")
+                else:
+                    deriv_line2.append(f"OI: ${oi_val:,.0f} ", style="cyan")
+            if self.liquidation_data:
+                total_liq = self.liquidation_data.total_liquidations_24h
+                if total_liq > 0:
+                    liq_color = "red" if total_liq > 100000 else "yellow"
+                    deriv_line2.append(f"| 24h爆仓: ${total_liq:,.0f} ", style=liq_color)
+                    deriv_line2.append(f"({self.liquidation_data.liquidation_bias})", style=liq_color)
+            deriv_line2.append(" " * max(0, 70 - len(str(deriv_line2)) + 15) + "│")
+            lines.append(deriv_line2)
+
+        # 分级CVD
+        if self.binned_cvd:
+            cvd_line = Text()
+            cvd_line.append("│ [资金流] ")
+            whale_cvd = self.binned_cvd.whale_cvd
+            shark_cvd = self.binned_cvd.shark_cvd
+            retail_cvd = self.binned_cvd.retail_cvd
+            cvd_line.append(f"鲸鱼: {whale_cvd:+,.0f} ", style="green" if whale_cvd > 0 else "red")
+            cvd_line.append(f"| 鲨鱼: {shark_cvd:+,.0f} ", style="green" if shark_cvd > 0 else "red")
+            cvd_line.append(f"| 散户: {retail_cvd:+,.0f}", style="green" if retail_cvd > 0 else "red")
+            cvd_line.append(" " * max(0, 70 - len(str(cvd_line)) + 15) + "│")
+            lines.append(cvd_line)
+
+            # 聪明钱信号
+            smart_signal = self.binned_cvd.smart_money_signal
+            if smart_signal:
+                smart_line = Text()
+                smart_line.append("│   ◉ ")
+                smart_line.append(f"【聪明钱】{smart_signal}", style="bold magenta")
+                smart_line.append(" " * max(0, 70 - len(str(smart_line)) + 15) + "│")
+                lines.append(smart_line)
+
+        # 爆仓瀑布警告
+        if self.liquidation_warning:
+            liq_warn_line = Text()
+            liq_warn_line.append("│   ")
+            liq_warn_line.append(self.liquidation_warning, style="bold red")
+            liq_warn_line.append(" " * max(0, 70 - len(str(liq_warn_line)) + 15) + "│")
+            lines.append(liq_warn_line)
+
+        # 多空比反向信号
+        if self.long_short_ratio:
+            contrarian = self.long_short_ratio.contrarian_signal
+            if "极度" in contrarian or "警惕" in contrarian or "可能" in contrarian:
+                contra_line = Text()
+                contra_line.append("│   ◉ ")
+                contra_line.append(f"【反向指标】{contrarian}", style="bold yellow")
+                contra_line.append(" " * max(0, 70 - len(str(contra_line)) + 15) + "│")
+                lines.append(contra_line)
 
         # 执行环境
         env_line = Text()
@@ -577,6 +899,16 @@ class CommandCenter:
         # 检测模式
         self.current_pattern = self.detect_pattern()
 
+        # 检测庄家演戏
+        self.manipulation_alert = self.detect_manipulation(data)
+
+        # 检测战略洗盘
+        wash_type, wash_msg = self.detect_strategic_wash()
+        self.strategic_wash = wash_msg
+
+        # 计算综合评分
+        self.market_score = self.calculate_score()
+
         # 保持信号记录在合理范围
         if len(self.resonance_signals) > 100:
             self.resonance_signals = self.resonance_signals[-100:]
@@ -591,8 +923,9 @@ class CommandCenter:
         console.print(f"运行模式: {self.mode}")
         console.print("-" * 50)
 
-        # 初始更新MTF趋势
+        # 初始更新MTF趋势和合约数据
         await self.update_mtf_trends()
+        await self.fetch_derivatives_data()
 
         mtf_counter = 0
 
@@ -601,10 +934,11 @@ class CommandCenter:
                 try:
                     await self.run_once()
 
-                    # 每60秒更新MTF趋势
+                    # 每60秒更新MTF趋势和合约数据
                     mtf_counter += 5
                     if mtf_counter >= 60:
                         await self.update_mtf_trends()
+                        await self.fetch_derivatives_data()
                         mtf_counter = 0
 
                     live.update(self.build_display())
@@ -621,6 +955,8 @@ class CommandCenter:
         self.running = False
         if self.exchange:
             await self.exchange.close()
+        if self.derivatives_fetcher:
+            await self.derivatives_fetcher.close()
         logger.info("System C 已关闭")
 
 
