@@ -1,16 +1,17 @@
 @echo off
+chcp 65001 >nul
 cd /d "%~dp0"
 echo ========================================
-echo   Flow Radar - Auto Alert Monitor
+echo   Flow Radar - Analysis System
 echo   DOGE/USDT
 echo ========================================
 echo.
-echo   This will monitor and ALERT you with sound!
-echo   You can do other things, just listen for beeps.
+echo   Features:
+echo   1. Surface signals (Score/Trend/Whale)
+echo   2. Hidden signals (Iceberg detection)
+echo   3. Smart judgment (Wash/Dump/Real)
 echo.
-echo   Buy signal: High-pitched beeps
-echo   Sell signal: Low-pitched beeps
-echo   Warning: Rapid beeps
+echo   Sound alerts on important signals!
 echo.
 echo ========================================
 echo.
