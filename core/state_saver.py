@@ -86,11 +86,11 @@ class StateSaver:
         }
 
         try:
-            # 原子写入：先写临时文件，再重命名
+            # 原子写入：先写临时文件，再替换
             tmp_path = self.filepath.with_suffix('.tmp')
             with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(checkpoint, f, indent=2)
-            tmp_path.rename(self.filepath)
+            tmp_path.replace(self.filepath)  # replace() 可以覆盖已存在的文件
 
             self.last_save_ts = current_ts
             return True

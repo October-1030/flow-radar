@@ -22,10 +22,9 @@ if errorlevel 1 (
 
 echo.
 echo [2/2] 启动72小时验证...
-echo 日志文件: logs/72h_run_%date:~0,4%%date:~5,2%%date:~8,2%.log
 echo.
 
-REM 启动监控 (前台运行，方便查看)
-python alert_monitor.py -s DOGE/USDT 2>&1 | tee logs/72h_run_%date:~0,4%%date:~5,2%%date:~8,2%.log
+REM 启动监控 (前台运行)
+python alert_monitor.py -s DOGE/USDT
 
 pause
