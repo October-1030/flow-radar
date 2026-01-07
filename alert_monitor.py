@@ -320,8 +320,31 @@ class AlertMonitor:
             now = time.time()
             for key, state in saved.throttle_state.items():
                 # 跳过超过 30 分钟的条目
-                if now - state.get('last_time', 0) > 1800:
-                    continue
+                last_time_value = state.get('last_time', 0)
+
+                # 处理类型转换：如果是 float/int，转换为 datetime；如果已是 datetime，保持不变
+                if isinstance(last_time_value, (int, float)):
+                    if now - last_time_value > 1800:
+                        continue
+                    state['last_time'] = datetime.fromtimestamp(last_time_value)
+                elif isinstance(last_time_value, str):
+                    # 如果是字符串，尝试解析
+                    try:
+                        state['last_time'] = datetime.fromisoformat(last_time_value)
+                    except:
+                        continue
+
+                # 同样处理 silenced_until
+                silenced_until = state.get('silenced_until')
+                if silenced_until:
+                    if isinstance(silenced_until, (int, float)):
+                        state['silenced_until'] = datetime.fromtimestamp(silenced_until)
+                    elif isinstance(silenced_until, str):
+                        try:
+                            state['silenced_until'] = datetime.fromisoformat(silenced_until)
+                        except:
+                            state['silenced_until'] = None
+
                 self._alert_throttle[key] = state
             if self._alert_throttle:
                 console.print(f"[dim]  ├─ 节流状态: {len(self._alert_throttle)} 条目[/dim]")

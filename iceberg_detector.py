@@ -33,62 +33,31 @@ except ImportError:
     sys.exit(1)
 
 from config.settings import CONFIG_ICEBERG, CONFIG_MARKET
+from core.price_level import PriceLevel, IcebergLevel, CONFIG_PRICE_LEVEL
 
 
-# 配置日志
+# 配置日志（强制 UTF-8 编码以支持中文）
+import sys
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(CONFIG_ICEBERG['log_path']),
-        logging.StreamHandler()
+        logging.FileHandler(CONFIG_ICEBERG['log_path'], encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
     ]
 )
 logger = logging.getLogger('SystemI')
 
-console = Console()
+# 强制 StreamHandler 使用 UTF-8（Windows 兼容）
+for handler in logging.root.handlers:
+    if isinstance(handler, logging.StreamHandler):
+        handler.stream.reconfigure(encoding='utf-8') if hasattr(handler.stream, 'reconfigure') else None
+
+# Rich Console 配置（强制 UTF-8，禁用旧版 Windows 渲染）
+console = Console(force_terminal=True, legacy_windows=False)
 
 
-@dataclass
-class PriceLevel:
-    """价格层级追踪"""
-    price: float
-    visible_quantity: float = 0.0          # 当前可见挂单量
-    cumulative_filled: float = 0.0          # 累计成交量
-    fill_count: int = 0                     # 成交次数
-    first_seen: datetime = field(default_factory=datetime.now)
-    last_updated: datetime = field(default_factory=datetime.now)
-    refill_count: int = 0                   # 补单次数
-    previous_visible: float = 0.0           # 上次可见量
-
-    def update(self, new_visible: float, filled: float = 0):
-        """更新价格层级"""
-        # 检测补单行为
-        if new_visible > self.visible_quantity and self.visible_quantity > 0:
-            self.refill_count += 1
-
-        self.previous_visible = self.visible_quantity
-        self.visible_quantity = new_visible
-        self.cumulative_filled += filled
-        if filled > 0:
-            self.fill_count += 1
-        self.last_updated = datetime.now()
-
-    @property
-    def intensity(self) -> float:
-        """计算冰山强度"""
-        if self.visible_quantity == 0:
-            return 0.0
-        return self.cumulative_filled / self.visible_quantity
-
-    @property
-    def is_iceberg(self) -> bool:
-        """判断是否为冰山单"""
-        return (
-            self.intensity >= CONFIG_ICEBERG['intensity_threshold'] and
-            self.cumulative_filled >= CONFIG_ICEBERG['min_cumulative_volume'] and
-            self.refill_count >= CONFIG_ICEBERG['min_refill_count']
-        )
+# PriceLevel 和 IcebergLevel 已从 core.price_level 导入
 
 
 @dataclass
@@ -109,6 +78,98 @@ class IcebergSignal:
                 f"挂单深度: {self.visible_depth:.2f}U | 强度: {self.intensity:.2f}x")
 
 
+class TradeDeduplicator:
+    """
+    P0-2: 成交去重器 (P2-1: deque 优化版)
+
+    使用 (timestamp, id) 组合作为唯一标识，
+    维护一个固定容量的 seen-set 防止重复处理同一笔成交。
+
+    性能优化: 使用 collections.deque 替代 list，淘汰操作从 O(n) 变为 O(1)
+    """
+
+    def __init__(self, max_size: int = 1000):
+        """
+        Args:
+            max_size: seen-set 最大容量，超出时自动移除最旧的记录
+        """
+        from collections import deque
+        self.max_size = max_size
+        self._seen: Dict[str, datetime] = {}      # trade_key -> first_seen_time
+        self._order: deque = deque(maxlen=max_size)  # 自动淘汰，O(1) 性能
+
+    def _make_key(self, timestamp: int, trade_id: str) -> str:
+        """
+        生成唯一键
+
+        Args:
+            timestamp: 成交时间戳 (毫秒)
+            trade_id: 成交ID (可能是字符串或数字)
+
+        Returns:
+            唯一键字符串
+        """
+        trade_id_str = str(trade_id) if trade_id is not None else ""
+        return f"{timestamp}:{trade_id_str}"
+
+    def is_duplicate(self, timestamp: int, trade_id: str) -> bool:
+        """
+        检查成交是否重复
+
+        Args:
+            timestamp: 成交时间戳 (毫秒)
+            trade_id: 成交ID
+
+        Returns:
+            True 如果是重复成交，False 如果是新成交
+        """
+        key = self._make_key(timestamp, trade_id)
+
+        if key in self._seen:
+            return True
+
+        # 新成交，添加到 seen-set
+        # deque(maxlen=N) 满时自动丢弃最左边的元素，需要同步清理 _seen
+        if len(self._order) == self.max_size:
+            oldest_key = self._order[0]  # 即将被淘汰的 key
+            self._seen.pop(oldest_key, None)
+
+        self._seen[key] = datetime.now()
+        self._order.append(key)  # 自动淘汰旧元素
+
+        return False
+
+    def filter_trades(self, trades: List[Dict]) -> List[Dict]:
+        """
+        过滤掉重复的成交记录
+
+        Args:
+            trades: 原始成交列表，每个元素需包含 'timestamp' 和 'id' 字段
+
+        Returns:
+            去重后的成交列表
+        """
+        unique_trades = []
+        for trade in trades:
+            ts = trade.get('timestamp', 0)
+            tid = trade.get('id', trade.get('trade_id', ''))
+
+            if not self.is_duplicate(ts, tid):
+                unique_trades.append(trade)
+
+        return unique_trades
+
+    @property
+    def seen_count(self) -> int:
+        """返回已见成交数量"""
+        return len(self._seen)
+
+    def clear(self) -> None:
+        """清空去重缓存"""
+        self._seen.clear()
+        self._order.clear()
+
+
 class IcebergDetector:
     """System I - 冰山单检测器"""
 
@@ -124,6 +185,9 @@ class IcebergDetector:
 
         # 成交记录
         self.recent_trades: List[Dict] = []
+
+        # P0-2: 成交去重器
+        self.trade_deduplicator = TradeDeduplicator(max_size=1000)
 
         # 检测到的冰山单
         self.iceberg_signals: List[IcebergSignal] = []
@@ -147,7 +211,11 @@ class IcebergDetector:
         return round(price, 6)
 
     def _match_trades_to_levels(self, trades: List[Dict], orderbook: Dict):
-        """将成交匹配到价格层级"""
+        """
+        将成交匹配到价格层级
+
+        P0-3: 同时用成交数据"解释"订单簿的消失量
+        """
         for trade in trades:
             price = self._normalize_price(trade['price'])
             quantity = trade['quantity']
@@ -157,20 +225,25 @@ class IcebergDetector:
             if is_buy:
                 # 主动买入 -> 吃掉卖单
                 if price in self.ask_levels:
-                    self.ask_levels[price].update(
-                        self.ask_levels[price].visible_quantity,
-                        quantity
-                    )
+                    level = self.ask_levels[price]
+                    level.update(level.visible_quantity, quantity)
+                    # P0-3: 用实际成交解释消失量
+                    level.explain_with_trade(quantity)
             else:
                 # 主动卖出 -> 吃掉买单
                 if price in self.bid_levels:
-                    self.bid_levels[price].update(
-                        self.bid_levels[price].visible_quantity,
-                        quantity
-                    )
+                    level = self.bid_levels[price]
+                    level.update(level.visible_quantity, quantity)
+                    # P0-3: 用实际成交解释消失量
+                    level.explain_with_trade(quantity)
 
     def _update_orderbook_levels(self, orderbook: Dict):
-        """更新订单簿层级"""
+        """
+        更新订单簿层级
+
+        P0-3: 记录消失量，但不假设都是成交。
+        实际成交由 _match_trades_to_levels 确认。
+        """
         current_time = datetime.now()
         cleanup_threshold = current_time - timedelta(seconds=CONFIG_ICEBERG['detection_window'])
 
@@ -179,10 +252,12 @@ class IcebergDetector:
         for price, quantity in current_bids.items():
             if price in self.bid_levels:
                 old_visible = self.bid_levels[price].visible_quantity
-                # 如果可见量减少，说明有成交
+                # 如果可见量减少，记录消失量（可能是成交或撤单）
                 if quantity < old_visible:
-                    filled = old_visible - quantity
-                    self.bid_levels[price].update(quantity, filled)
+                    disappeared = old_visible - quantity
+                    # P0-3: 只记录消失，不假设成交
+                    self.bid_levels[price].record_disappeared(disappeared)
+                    self.bid_levels[price].update(quantity)  # 不传 filled，由 _match_trades 确认
                 else:
                     self.bid_levels[price].update(quantity)
             else:
@@ -194,8 +269,10 @@ class IcebergDetector:
             if price in self.ask_levels:
                 old_visible = self.ask_levels[price].visible_quantity
                 if quantity < old_visible:
-                    filled = old_visible - quantity
-                    self.ask_levels[price].update(quantity, filled)
+                    disappeared = old_visible - quantity
+                    # P0-3: 只记录消失，不假设成交
+                    self.ask_levels[price].record_disappeared(disappeared)
+                    self.ask_levels[price].update(quantity)  # 不传 filled，由 _match_trades 确认
                 else:
                     self.ask_levels[price].update(quantity)
             else:
@@ -257,7 +334,11 @@ class IcebergDetector:
         return detected
 
     def _calculate_confidence(self, level: PriceLevel) -> float:
-        """计算冰山单置信度"""
+        """
+        计算冰山单置信度
+
+        P0-3: 增加 Spoofing 惩罚机制
+        """
         confidence = 50.0
 
         # 强度贡献
@@ -278,7 +359,18 @@ class IcebergDetector:
         elif level.cumulative_filled >= 2000:
             confidence += 10
 
-        return min(95.0, confidence)
+        # P0-3: iceberg_strength 贡献
+        if level.iceberg_strength >= 1.0:
+            confidence += 10
+        elif level.iceberg_strength >= 0.5:
+            confidence += 5
+
+        # P0-3: Spoofing 惩罚 - 低解释比例降低置信度
+        spoofing_penalty = level.get_confidence_penalty()
+        confidence -= spoofing_penalty
+
+        # 确保置信度在合理范围内
+        return max(20.0, min(95.0, confidence))
 
     def get_summary_stats(self) -> Dict:
         """获取汇总统计"""
@@ -376,26 +468,35 @@ class IcebergDetector:
                     'price': t['price'],
                     'quantity': t['amount'],
                     'is_buyer_maker': t['side'] == 'sell',
-                    'timestamp': t['timestamp']
+                    'timestamp': t['timestamp'],
+                    'id': t.get('id', t.get('trade_id', '')),  # P0-2: 添加 id 用于去重
                 }
                 for t in trades
             ]
 
+            # P0-2: 成交去重 - 过滤掉已处理过的成交
+            unique_trades = self.trade_deduplicator.filter_trades(formatted_trades)
+
             # 更新订单簿层级
             self._update_orderbook_levels(orderbook)
 
-            # 匹配成交到层级
-            self._match_trades_to_levels(formatted_trades, orderbook)
+            # 匹配成交到层级（只处理新成交）
+            self._match_trades_to_levels(unique_trades, orderbook)
 
             # 检测冰山单
             new_icebergs = self.detect_icebergs()
 
             if new_icebergs:
                 for signal in new_icebergs:
-                    console.print(f"[bold {'green' if signal.side == 'BUY' else 'red'}]{signal}[/bold]")
+                    color = 'green' if signal.side == 'BUY' else 'red'
+                    # 转义方括号避免 Rich 解析错误
+                    signal_text = str(signal).replace('[', '\\[').replace(']', '\\]')
+                    console.print(f"[bold {color}]{signal_text}[/bold]")
 
         except Exception as e:
+            import traceback
             logger.error(f"检测错误: {e}")
+            logger.debug(f"详细错误信息:\n{traceback.format_exc()}")
 
     async def run(self):
         """主运行循环"""
