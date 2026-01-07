@@ -333,8 +333,8 @@ class AlertMonitor:
             restored_count = 0
             for ice in saved.active_icebergs:
                 # 跳过超过 5 分钟的冰山
-                last_update = ice.get('last_update', 0)
-                if now - last_update > 300:
+                last_updated_ts = ice.get('last_updated', 0)  # 修复字段名: last_update -> last_updated
+                if now - last_updated_ts > 300:
                     continue
 
                 price = ice.get('price', 0)
@@ -345,9 +345,10 @@ class AlertMonitor:
                 level.cumulative_filled = ice.get('cumulative_filled', 0)
                 level.refill_count = ice.get('refill_count', 0)
                 level.intensity = ice.get('intensity', 0)
-                level.first_seen = ice.get('first_seen', now)
                 # 修复: 将 float 时间戳转为 datetime 对象
-                level.last_updated = datetime.fromtimestamp(last_update) if last_update > 0 else datetime.now()
+                first_seen_ts = ice.get('first_seen', now)
+                level.first_seen = datetime.fromtimestamp(first_seen_ts) if first_seen_ts > 0 else datetime.now()
+                level.last_updated = datetime.fromtimestamp(last_updated_ts) if last_updated_ts > 0 else datetime.now()
 
                 if side == 'BUY':
                     self.bid_levels[price] = level
@@ -403,8 +404,8 @@ class AlertMonitor:
                     'refill_count': level.refill_count,
                     'intensity': level.intensity,
                     'level': ice_level.name,
-                    'first_seen': level.first_seen,
-                    'last_updated': level.last_updated,
+                    'first_seen': level.first_seen.timestamp(),  # 修复: datetime -> timestamp
+                    'last_updated': level.last_updated.timestamp(),  # 修复: datetime -> timestamp
                 })
 
         for price, level in self.ask_levels.items():
@@ -417,8 +418,8 @@ class AlertMonitor:
                     'refill_count': level.refill_count,
                     'intensity': level.intensity,
                     'level': ice_level.name,
-                    'first_seen': level.first_seen,
-                    'last_updated': level.last_updated,
+                    'first_seen': level.first_seen.timestamp(),  # 修复: datetime -> timestamp
+                    'last_updated': level.last_updated.timestamp(),  # 修复: datetime -> timestamp
                 })
 
         return active
