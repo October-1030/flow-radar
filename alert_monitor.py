@@ -8,6 +8,7 @@ Flow Radar - Alert Monitor (Upgraded)
 
 import asyncio
 import argparse
+import time
 import winsound
 import sys
 from datetime import datetime, timedelta
@@ -31,7 +32,10 @@ except ImportError:
     print("请安装 rich: pip install rich")
     sys.exit(1)
 
-from config.settings import CONFIG_MARKET, CONFIG_ICEBERG
+from config.settings import (
+    CONFIG_MARKET, CONFIG_ICEBERG, CONFIG_WEBSOCKET,
+    CONFIG_DISCORD, CONFIG_FEATURES, CONFIG_ALERT_THROTTLE
+)
 from core.indicators import Indicators
 from core.derivatives import (
     DerivativesDataFetcher, calculate_binned_cvd,
@@ -44,8 +48,12 @@ from core.state_machine import (
 from core.event_logger import EventLogger
 from core.dynamic_threshold import DynamicThresholdEngine
 from core.trade_deduplicator import TradeDeduplicator
-from core.state_saver import StateSaver
+from core.state_saver import StateSaver, ExtendedState
 from core.divergence_detector import DivergenceDetector, DivergenceType
+from core.websocket_manager import WebSocketManager, load_websocket_config
+from core.discord_notifier import DiscordNotifier, AlertMessage
+from core.price_level import PriceLevel, IcebergLevel, CONFIG_PRICE_LEVEL
+from core.run_metadata import RunMetadataRecorder
 
 console = Console()
 
@@ -126,92 +134,7 @@ class MetricsCollector:
         console.print(f"保存耗时: 平均{r['avg_save_duration_ms']:.1f}ms, 最大{r['max_save_duration_ms']:.1f}ms")
 
 
-class IcebergLevel(Enum):
-    """冰山信号级别 (GPT 建议: 区分噪音和确认信号)"""
-    NONE = "none"                        # 无冰山活动
-    ACTIVITY = "refill_activity"         # 有补单活动 (可能是做市噪音)
-    CONFIRMED = "confirmed_iceberg"      # 确认冰山 (满足吸收度条件)
-
-
-@dataclass
-class PriceLevel:
-    """价格层级追踪"""
-    price: float
-    visible_quantity: float = 0.0
-    cumulative_filled: float = 0.0
-    fill_count: int = 0
-    first_seen: datetime = field(default_factory=datetime.now)
-    last_updated: datetime = field(default_factory=datetime.now)
-    refill_count: int = 0
-    previous_visible: float = 0.0
-    max_visible: float = 0.0  # 历史最大可见量
-
-    def update(self, new_visible: float, filled: float = 0):
-        """
-        更新价格层级状态
-
-        修复 Full Absorption 漏判：
-        - 旧逻辑: visible_quantity > 0 时才判断 refill，100→0→100 会漏报
-        - 新逻辑: 基于 previous_visible 判断，被吃掉80%以上且回补50%以上计为 refill
-        """
-        # 更新历史最大值
-        self.max_visible = max(self.max_visible, new_visible)
-
-        # 检测补单 (refill)
-        if self.previous_visible > 0:
-            # 计算被吃掉的比例
-            consumed_ratio = 1 - (self.visible_quantity / self.previous_visible)
-            # 被吃掉80%以上，且回补超过历史峰值的50%，计为一次 refill
-            if consumed_ratio >= 0.8 and new_visible >= self.max_visible * 0.5:
-                self.refill_count += 1
-        elif self.visible_quantity == 0 and new_visible > 0 and self.cumulative_filled > 0:
-            # 完全消耗后又出现 (100→0→100 场景)
-            self.refill_count += 1
-
-        self.previous_visible = self.visible_quantity
-        self.visible_quantity = new_visible
-        self.cumulative_filled += filled
-        if filled > 0:
-            self.fill_count += 1
-        self.last_updated = datetime.now()
-
-    @property
-    def intensity(self) -> float:
-        # 使用历史最大值计算强度，避免除零
-        base = max(self.visible_quantity, self.max_visible, 1)
-        return self.cumulative_filled / base
-
-    @property
-    def is_iceberg(self) -> bool:
-        return (
-            self.intensity >= CONFIG_ICEBERG['intensity_threshold'] and
-            self.cumulative_filled >= CONFIG_ICEBERG['min_cumulative_volume'] and
-            self.refill_count >= CONFIG_ICEBERG['min_refill_count']
-        )
-
-    def get_iceberg_level(self) -> IcebergLevel:
-        """
-        获取冰山信号级别 (GPT 建议: 区分 Activity vs Confirmed)
-
-        - NONE: 无任何冰山活动
-        - ACTIVITY: 有补单活动，可能是做市噪音
-        - CONFIRMED: 满足吸收度 >= 3，确认是冰山单
-
-        Returns:
-            IcebergLevel: 冰山信号级别
-        """
-        # 计算吸收度 (累计成交 / 可见量)
-        absorption = self.cumulative_filled / max(self.max_visible, 1)
-
-        # 确认冰山: 吸收度 >= 3 且补单次数 >= 3
-        if absorption >= 3.0 and self.refill_count >= 3:
-            return IcebergLevel.CONFIRMED
-
-        # 有活动: 至少有1次补单
-        if self.refill_count >= 1:
-            return IcebergLevel.ACTIVITY
-
-        return IcebergLevel.NONE
+# PriceLevel 和 IcebergLevel 已从 core.price_level 导入
 
 
 @dataclass
@@ -247,6 +170,9 @@ class AlertMonitor:
         self.last_pattern = ""
         self.alerts_history: List[Dict] = []
         self.current_price = 0.0
+
+        # P2-3: 告警降噪
+        self._alert_throttle: Dict[str, Dict] = {}  # key -> {last_time, count, silenced_until}
 
         # 警报阈值
         self.score_buy_threshold = 60
@@ -321,12 +247,40 @@ class AlertMonitor:
         # ========== 72小时验证监控 ==========
         self.metrics = MetricsCollector()
 
+        # ========== WebSocket 实时数据 ==========
+        self.ws_manager: Optional[WebSocketManager] = None
+        self.use_websocket = CONFIG_FEATURES.get('websocket_enabled', False) and CONFIG_WEBSOCKET.get('enabled', False)
+        if self.use_websocket:
+            self.ws_manager = WebSocketManager(self.symbol, load_websocket_config())
+
+        # ========== Discord 通知 ==========
+        self.discord_notifier: Optional[DiscordNotifier] = None
+        self.use_discord = CONFIG_FEATURES.get('discord_enabled', False) and CONFIG_DISCORD.get('enabled', False)
+        if self.use_discord:
+            self.discord_notifier = DiscordNotifier(CONFIG_DISCORD)
+
+        # ========== P3: 健康检查通知 ==========
+        self._last_health_status: str = 'HEALTHY'
+        self._last_health_notify_time: float = 0
+        self._health_notify_cooldown: float = 60.0  # 同状态 60s 内只发一次
+
+        # ========== P3: Run 元信息记录 ==========
+        self.run_recorder = RunMetadataRecorder(symbols=[self.symbol])
+        self.run_recorder.save()
+        console.print(f"[dim]Run ID: {self.run_recorder.run_id}[/dim]")
+
     def _restore_state(self):
-        """Step C: 启动时恢复状态"""
-        saved = self.state_saver.load()
+        """Step C: 启动时恢复状态 (P2-4: 扩展版)"""
+        # P2-4: 优先尝试加载扩展状态
+        if self.state_saver.has_extended_state():
+            saved = self.state_saver.load_extended()
+        else:
+            saved = self.state_saver.load()
+
         if saved:
             # 检查状态是否过期 (超过24小时视为过期)
             if not self.state_saver.is_stale(max_age_hours=24):
+                # 恢复基础状态
                 self.cvd_total = saved.cvd_total
                 self.total_whale_flow = saved.total_whale_flow
                 self.iceberg_buy_count = saved.iceberg_buy_count
@@ -334,14 +288,81 @@ class AlertMonitor:
                 self.iceberg_buy_volume = saved.iceberg_buy_volume
                 self.iceberg_sell_volume = saved.iceberg_sell_volume
                 self.last_score = saved.last_score
-                console.print(f"[green]✓ 状态恢复成功[/green] CVD={self.cvd_total:.0f}, 鲸流={self.total_whale_flow:.0f}")
+
+                # P2-4: 恢复扩展状态
+                extended_restored = False
+                if isinstance(saved, ExtendedState):
+                    extended_restored = self._restore_extended_state(saved)
+
+                status_msg = f"CVD={self.cvd_total:.0f}, 鲸流={self.total_whale_flow:.0f}"
+                if extended_restored:
+                    status_msg += " [扩展状态已恢复]"
+                console.print(f"[green]✓ 状态恢复成功[/green] {status_msg}")
             else:
                 console.print(f"[yellow]⚠ 状态已过期，重新开始[/yellow]")
         else:
             console.print(f"[dim]无历史状态，从零开始[/dim]")
 
+    def _restore_extended_state(self, saved: ExtendedState) -> bool:
+        """
+        P2-4: 恢复扩展状态 (冰山 + 节流)
+
+        Args:
+            saved: 扩展状态对象
+
+        Returns:
+            bool: 是否成功恢复
+        """
+        restored = False
+
+        # 恢复告警节流状态
+        if saved.throttle_state:
+            now = time.time()
+            for key, state in saved.throttle_state.items():
+                # 跳过超过 30 分钟的条目
+                if now - state.get('last_time', 0) > 1800:
+                    continue
+                self._alert_throttle[key] = state
+            if self._alert_throttle:
+                console.print(f"[dim]  ├─ 节流状态: {len(self._alert_throttle)} 条目[/dim]")
+                restored = True
+
+        # 恢复活跃冰山信号
+        if saved.active_icebergs:
+            now = time.time()
+            restored_count = 0
+            for ice in saved.active_icebergs:
+                # 跳过超过 5 分钟的冰山
+                last_update = ice.get('last_update', 0)
+                if now - last_update > 300:
+                    continue
+
+                price = ice.get('price', 0)
+                side = ice.get('side', 'BUY')
+
+                # 重建 PriceLevel
+                level = PriceLevel(price=price)
+                level.cumulative_filled = ice.get('cumulative_filled', 0)
+                level.refill_count = ice.get('refill_count', 0)
+                level.intensity = ice.get('intensity', 0)
+                level.first_seen = ice.get('first_seen', now)
+                # 修复: 将 float 时间戳转为 datetime 对象
+                level.last_updated = datetime.fromtimestamp(last_update) if last_update > 0 else datetime.now()
+
+                if side == 'BUY':
+                    self.bid_levels[price] = level
+                else:
+                    self.ask_levels[price] = level
+                restored_count += 1
+
+            if restored_count > 0:
+                console.print(f"[dim]  └─ 活跃冰山: {restored_count} 个[/dim]")
+                restored = True
+
+        return restored
+
     def _save_state(self, event_ts: float):
-        """Step C: 定期保存状态"""
+        """Step C: 定期保存状态 (P2-4: 扩展版)"""
         state = {
             'cvd_total': self.cvd_total,
             'total_whale_flow': self.total_whale_flow,
@@ -353,7 +374,54 @@ class AlertMonitor:
             'last_score': self.last_score,
             'last_price': self.current_price,
         }
-        self.state_saver.save(state, event_ts)
+
+        # P2-4: 使用扩展保存 (含冰山 + 节流)
+        active_icebergs = self._serialize_active_icebergs()
+        self.state_saver.save_extended(
+            state=state,
+            active_icebergs=active_icebergs,
+            throttle_state=self._alert_throttle,
+            current_ts=event_ts
+        )
+
+    def _serialize_active_icebergs(self) -> list:
+        """
+        P2-4: 序列化活跃冰山信号
+
+        Returns:
+            list: 活跃冰山列表 [{side, price, cumulative_filled, ...}]
+        """
+        active = []
+
+        for price, level in self.bid_levels.items():
+            ice_level = level.get_iceberg_level()
+            if ice_level != IcebergLevel.NONE:
+                active.append({
+                    'side': 'BUY',
+                    'price': price,
+                    'cumulative_filled': level.cumulative_filled,
+                    'refill_count': level.refill_count,
+                    'intensity': level.intensity,
+                    'level': ice_level.name,
+                    'first_seen': level.first_seen,
+                    'last_updated': level.last_updated,
+                })
+
+        for price, level in self.ask_levels.items():
+            ice_level = level.get_iceberg_level()
+            if ice_level != IcebergLevel.NONE:
+                active.append({
+                    'side': 'SELL',
+                    'price': price,
+                    'cumulative_filled': level.cumulative_filled,
+                    'refill_count': level.refill_count,
+                    'intensity': level.intensity,
+                    'level': ice_level.name,
+                    'first_seen': level.first_seen,
+                    'last_updated': level.last_updated,
+                })
+
+        return active
 
     async def initialize(self):
         """初始化"""
@@ -384,8 +452,21 @@ class AlertMonitor:
         except:
             pass
 
-    def add_alert(self, level: str, message: str, alert_type: str = "normal"):
-        """添加警报"""
+    def add_alert(self, level: str, message: str, alert_type: str = "normal", confidence: float = 50.0):
+        """
+        添加警报 (P2-3: 含降噪逻辑)
+
+        Args:
+            level: 告警级别 (info/warning/critical/opportunity)
+            message: 告警消息
+            alert_type: 告警类型 (用于声音)
+            confidence: 置信度
+        """
+        # P2-3: 告警降噪检查
+        if CONFIG_ALERT_THROTTLE.get('enabled', True):
+            if self._is_alert_throttled(level, message):
+                return  # 被节流，跳过
+
         self.metrics.record_alert()  # 监控: 记录告警
         alert = {
             "time": datetime.now(),
@@ -397,13 +478,312 @@ class AlertMonitor:
             self.alerts_history = self.alerts_history[-20:]
         self.play_alert(alert_type)
 
-    async def fetch_data(self) -> Optional[Dict]:
-        """获取所有数据"""
+        # Discord 通知
+        if self.discord_notifier and self.discord_notifier.should_notify(confidence):
+            asyncio.create_task(self._send_discord_alert(level, message, alert_type, confidence))
+
+    def _make_throttle_key(self, level: str, message: str,
+                           side: str = None, price: float = None,
+                           iceberg_level: str = None,
+                           alert_type: str = None) -> str:
+        """
+        P3-1: 生成节流 key (含 type 字段)
+
+        格式:
+        - 冰山告警: iceberg:{symbol}:{side}:{level}:{price_bucket}
+        - 普通告警: {type}:{level}:{msg_prefix}
+        - 健康告警: health:{symbol}:{status}
+
+        Args:
+            level: 告警级别
+            message: 告警消息
+            side: 方向 (BUY/SELL)
+            price: 价格
+            iceberg_level: 冰山等级 (ACTIVITY/CONFIRMED)
+            alert_type: 告警类型 (iceberg/whale/health/system)
+        """
+        if side and price is not None:
+            # 冰山告警: type:symbol:side:level:price_bucket
+            price_bucket = round(price, 4)
+            ice_lvl = iceberg_level or 'UNKNOWN'
+            return f"iceberg:{self.symbol}:{side}:{ice_lvl}:{price_bucket}"
+        elif alert_type == 'health':
+            # 健康告警: health:symbol:status
+            return f"health:{self.symbol}:{level}"
+        else:
+            # 普通告警: type:level:msg_prefix
+            a_type = alert_type or 'alert'
+            msg_prefix = message[:20] if len(message) > 20 else message
+            return f"{a_type}:{level}:{msg_prefix}"
+
+    @staticmethod
+    def _iceberg_level_value(level_name: str) -> int:
+        """
+        将冰山等级名称转换为数值 (用于通用比较)
+
+        NONE=0, ACTIVITY=1, CONFIRMED=2
+        """
+        level_map = {'NONE': 0, 'ACTIVITY': 1, 'CONFIRMED': 2}
+        return level_map.get(level_name, 0)
+
+    def _is_alert_throttled(self, level: str, message: str,
+                            side: str = None, price: float = None,
+                            iceberg_level: str = None,
+                            prev_iceberg_level: str = None) -> bool:
+        """
+        P2-3.1: 检查告警是否被节流 (升级版)
+
+        规则:
+        1. 相同 key 的告警有冷却时间
+        2. 重复超过阈值后进入静默期
+        3. 静默期内不发送任何同类告警
+        4. 等级升级 (new_level > old_level) 绕过节流
+
+        Returns:
+            True 如果应该被节流，False 如果应该发送
+        """
+        now = datetime.now()
+        cfg = CONFIG_ALERT_THROTTLE
+
+        # 通用等级升级绕过: new_level > old_level 即 bypass
+        if prev_iceberg_level and iceberg_level:
+            old_val = self._iceberg_level_value(prev_iceberg_level)
+            new_val = self._iceberg_level_value(iceberg_level)
+            if new_val > old_val:
+                # 任何等级升级都必须放行 (如 NONE→ACTIVITY, ACTIVITY→CONFIRMED)
+                return False
+
+        # 生成告警 key
+        alert_key = self._make_throttle_key(level, message, side, price, iceberg_level)
+
+        # 获取该 key 的节流状态
+        throttle_state = self._alert_throttle.get(alert_key)
+
+        if throttle_state is None:
+            # 首次告警，记录并放行
+            self._alert_throttle[alert_key] = {
+                'last_time': now,
+                'count': 1,
+                'silenced_until': None,
+                'suppressed_count': 0,  # P2-3.1: 静默期间抑制计数
+                'iceberg_level': iceberg_level,
+            }
+            return False
+
+        # 检查是否在静默期
+        if throttle_state.get('silenced_until'):
+            if now < throttle_state['silenced_until']:
+                throttle_state['suppressed_count'] += 1
+                return True  # 仍在静默期
+            else:
+                # P2-3.1: 静默期结束，输出摘要
+                suppressed = throttle_state.get('suppressed_count', 0)
+                if suppressed > 0:
+                    console.print(f"[dim]静默结束: '{alert_key}' 抑制了 {suppressed} 条告警[/dim]")
+                # 重置状态
+                throttle_state['count'] = 0
+                throttle_state['silenced_until'] = None
+                throttle_state['suppressed_count'] = 0
+
+        # 检查冷却时间
+        cooldown = cfg.get('level_cooldowns', {}).get(level, cfg.get('cooldown_seconds', 60))
+        elapsed = (now - throttle_state['last_time']).total_seconds()
+
+        if elapsed < cooldown:
+            # 在冷却期内，增加计数
+            throttle_state['count'] += 1
+
+            # 检查是否超过最大重复次数
+            if throttle_state['count'] >= cfg.get('max_repeat_count', 3):
+                # 进入静默期
+                silent_duration = cfg.get('silent_duration', 300)
+                throttle_state['silenced_until'] = now + timedelta(seconds=silent_duration)
+                throttle_state['suppressed_count'] = 0
+                console.print(f"[dim]告警降噪: '{alert_key}' 进入 {silent_duration}s 静默期[/dim]")
+
+            return True  # 节流
+
+        # 冷却期已过，重置计数并放行
+        throttle_state['last_time'] = now
+        throttle_state['count'] = 1
+        throttle_state['iceberg_level'] = iceberg_level
+        return False
+
+    def add_iceberg_alert(self, signal: 'IcebergSignal', prev_level: 'IcebergLevel' = None):
+        """
+        P2-3.1: 冰山专用告警 (含升级绕过)
+
+        Args:
+            signal: IcebergSignal 对象
+            prev_level: 之前的等级 (用于检测升级)
+        """
+        ice_level_name = signal.level.name if hasattr(signal.level, 'name') else str(signal.level)
+        prev_level_name = prev_level.name if prev_level and hasattr(prev_level, 'name') else None
+
+        # 检查节流
+        if CONFIG_ALERT_THROTTLE.get('enabled', True):
+            if self._is_alert_throttled(
+                level='iceberg',
+                message='',
+                side=signal.side,
+                price=signal.price,
+                iceberg_level=ice_level_name,
+                prev_iceberg_level=prev_level_name
+            ):
+                return  # 被节流
+
+        # 构建告警消息
+        level_tag = "✓确认" if ice_level_name == 'CONFIRMED' else "?活动"
+        side_cn = "买" if signal.side == 'BUY' else "卖"
+        message = f"冰山{side_cn}单 [{level_tag}] @{signal.price:.6f} 累计:{signal.cumulative_volume:.0f}U"
+
+        # 通用升级标记: new_level > old_level
+        old_val = self._iceberg_level_value(prev_level_name) if prev_level_name else 0
+        new_val = self._iceberg_level_value(ice_level_name)
+        if new_val > old_val:
+            message = f"🔺升级! {message}"
+
+        alert_type = 'buy' if signal.side == 'BUY' else 'sell'
+
+        self.metrics.record_alert()
+        alert = {
+            "time": datetime.now(),
+            "level": "iceberg",
+            "message": message
+        }
+        self.alerts_history.append(alert)
+        if len(self.alerts_history) > 20:
+            self.alerts_history = self.alerts_history[-20:]
+        self.play_alert(alert_type)
+
+        # Discord 通知
+        if self.discord_notifier and self.discord_notifier.should_notify(signal.confidence):
+            asyncio.create_task(self._send_discord_alert(
+                "iceberg", message, alert_type, signal.confidence
+            ))
+
+    async def _send_discord_alert(self, level: str, message: str, alert_type: str, confidence: float):
+        """异步发送 Discord 通知"""
         try:
-            ticker, orderbook, trades = await asyncio.gather(
-                self.exchange.fetch_ticker(self.symbol),
-                self.exchange.fetch_order_book(self.symbol, limit=20),
-                self.exchange.fetch_trades(self.symbol, limit=100)
+            await self.discord_notifier.send_simple(
+                symbol=self.symbol,
+                level=level,
+                message=message,
+                alert_type=alert_type,
+                price=self.current_price,
+                confidence=confidence,
+                state=self.current_signal.state_name if self.current_signal else "",
+                score=self.last_score,
+                extra_fields={
+                    "鲸鱼流向": f"${self.total_whale_flow:,.0f}",
+                    "MTF趋势": f"{self.mtf_trends.get('1D', '?')}/{self.mtf_trends.get('4H', '?')}/{self.mtf_trends.get('15M', '?')}",
+                } if self.discord_notifier.include_fields else None
+            )
+        except Exception as e:
+            console.print(f"[dim]Discord 通知失败: {e}[/dim]")
+
+    def _on_health_status_change(self, status: str, data: dict = None):
+        """
+        P3: 健康状态变化处理
+
+        触发条件:
+        - STALE: 数据过期
+        - DISCONNECTED: 连接断开
+        - HEALTHY: 恢复正常 (发 RECOVERED)
+
+        规则:
+        - 同状态 60s 内只发一次
+        - 恢复时发送 RECOVERED 通知
+        """
+        now = time.time()
+        prev_status = self._last_health_status
+
+        # 检查是否需要发送通知
+        should_notify = False
+        notify_type = status
+
+        if status in ('STALE', 'DISCONNECTED'):
+            # 异常状态
+            if status != prev_status or (now - self._last_health_notify_time) >= self._health_notify_cooldown:
+                should_notify = True
+        elif status == 'HEALTHY' and prev_status in ('STALE', 'DISCONNECTED'):
+            # 恢复状态
+            notify_type = 'RECOVERED'
+            should_notify = True
+
+        if should_notify and self.discord_notifier:
+            self._last_health_status = status
+            self._last_health_notify_time = now
+
+            # 构建消息
+            if notify_type == 'STALE':
+                data_age = data.get('data_age', 0) if data else 0
+                message = f"⚠️ 数据过期 | {self.symbol} | {data_age:.0f}秒无数据"
+                level = 'warning'
+            elif notify_type == 'DISCONNECTED':
+                message = f"🔴 连接断开 | {self.symbol}"
+                level = 'warning'
+            elif notify_type == 'RECOVERED':
+                message = f"✅ 已恢复 | {self.symbol}"
+                level = 'normal'
+            else:
+                return
+
+            console.print(f"[dim]健康通知: {message}[/dim]")
+            asyncio.create_task(self._send_health_discord(level, message))
+
+        # 更新状态
+        self._last_health_status = status
+
+    async def _send_health_discord(self, level: str, message: str):
+        """P3: 发送健康状态 Discord 通知"""
+        try:
+            await self.discord_notifier.send_simple(
+                symbol=self.symbol,
+                level=level,
+                message=message,
+                alert_type='health',
+                confidence=100,  # 健康通知总是发送
+            )
+        except Exception as e:
+            console.print(f"[dim]健康通知发送失败: {e}[/dim]")
+
+    async def fetch_data(self) -> Optional[Dict]:
+        """获取所有数据 (支持 WebSocket 混合模式)"""
+        # 尝试使用 WebSocket 数据
+        if self.ws_manager and self.ws_manager.is_connected:
+            ws_data = self.ws_manager.get_snapshot()
+            if ws_data:
+                # 转换 WebSocket 数据格式
+                formatted_trades = [
+                    {
+                        'price': t['price'],
+                        'quantity': t['amount'],
+                        'is_buyer_maker': t['side'] == 'sell',
+                        'timestamp': t['timestamp']
+                    }
+                    for t in ws_data.get('trades', [])
+                ]
+                return {
+                    'ticker': ws_data['ticker'],
+                    'orderbook': ws_data['orderbook'],
+                    'trades': formatted_trades
+                }
+
+        # 降级到 REST API
+        return await self._fetch_rest_data()
+
+    async def _fetch_rest_data(self) -> Optional[Dict]:
+        """通过 REST API 获取数据"""
+        try:
+            # 添加10秒超时保护
+            ticker, orderbook, trades = await asyncio.wait_for(
+                asyncio.gather(
+                    self.exchange.fetch_ticker(self.symbol),
+                    self.exchange.fetch_order_book(self.symbol, limit=20),
+                    self.exchange.fetch_trades(self.symbol, limit=100)
+                ),
+                timeout=10.0
             )
 
             formatted_trades = [
@@ -421,7 +801,11 @@ class AlertMonitor:
                 'orderbook': orderbook,
                 'trades': formatted_trades
             }
+        except asyncio.TimeoutError:
+            console.print("[yellow]⚠ 数据获取超时，跳过本次更新[/yellow]")
+            return None
         except Exception as e:
+            console.print(f"[red]数据获取错误: {e}[/red]")
             return None
 
     async def update_mtf(self):
@@ -429,7 +813,11 @@ class AlertMonitor:
         tf_map = {"15M": "15m", "4H": "4h", "1D": "1d"}
         for tf_display, tf_api in tf_map.items():
             try:
-                ohlcv = await self.exchange.fetch_ohlcv(self.symbol, tf_api, limit=20)
+                # 添加8秒超时保护
+                ohlcv = await asyncio.wait_for(
+                    self.exchange.fetch_ohlcv(self.symbol, tf_api, limit=20),
+                    timeout=8.0
+                )
                 if ohlcv and len(ohlcv) >= 10:
                     closes = [k[4] for k in ohlcv]
                     ma5 = sum(closes[-5:]) / 5
@@ -441,16 +829,24 @@ class AlertMonitor:
                         self.mtf_trends[tf_display] = "空"
                     else:
                         self.mtf_trends[tf_display] = "中性"
+            except asyncio.TimeoutError:
+                console.print(f"[yellow]⚠ {tf_display} K线获取超时[/yellow]")
             except:
                 pass
 
     async def update_derivatives(self):
         """更新合约数据"""
         try:
-            data = await self.derivatives.fetch_all(self.symbol)
+            # 添加8秒超时保护
+            data = await asyncio.wait_for(
+                self.derivatives.fetch_all(self.symbol),
+                timeout=8.0
+            )
             self.funding_rate = data.get("funding_rate")
             self.open_interest = data.get("open_interest")
             self.long_short_ratio = data.get("long_short_ratio")
+        except asyncio.TimeoutError:
+            console.print("[yellow]⚠ 合约数据获取超时[/yellow]")
         except:
             pass
 
@@ -499,58 +895,117 @@ class AlertMonitor:
         }
 
     def _calculate_confidence(self, level: PriceLevel) -> float:
-        confidence = 50.0
-        if level.intensity >= 10:
-            confidence += 20
-        elif level.intensity >= 5:
-            confidence += 10
-        if level.refill_count >= 10:
-            confidence += 15
-        elif level.refill_count >= 5:
-            confidence += 10
-        if level.cumulative_filled >= 5000:
-            confidence += 15
-        elif level.cumulative_filled >= 2000:
-            confidence += 10
-        return min(95.0, confidence)
+        """
+        计算冰山信号置信度 (P1-2: 集成 spoofing 惩罚)
+
+        使用 PriceLevel 的统一 calculate_confidence 方法，
+        已包含 spoofing 惩罚和可疑信号上限。
+        """
+        return level.calculate_confidence()
+
+    def _log_iceberg_signal(self, signal: 'IcebergSignal'):
+        """
+        P2-2: 持久化冰山信号到事件日志
+
+        Args:
+            signal: IcebergSignal 对象
+        """
+        if self.event_logger:
+            iceberg_data = {
+                'side': signal.side,
+                'price': signal.price,
+                'cumulative_volume': signal.cumulative_volume,
+                'visible_depth': signal.visible_depth,
+                'intensity': signal.intensity,
+                'refill_count': signal.refill_count,
+                'confidence': signal.confidence,
+                'level': signal.level.name if hasattr(signal.level, 'name') else str(signal.level),
+            }
+            self.event_logger.log_iceberg(iceberg_data, signal.timestamp.timestamp())
 
     def detect_icebergs(self):
-        """检测冰山单 (Step E: 区分 Activity vs Confirmed)"""
+        """检测冰山单 (Step E: 区分 Activity vs Confirmed) + P2-3.1 告警"""
         # 检测买单冰山
         for price, level in self.bid_levels.items():
-            if level.is_iceberg and price not in self.active_icebergs:
+            if level.is_iceberg:
                 ice_level = level.get_iceberg_level()
-                signal = IcebergSignal(
-                    timestamp=datetime.now(),
-                    price=price,
-                    side='BUY',
-                    cumulative_volume=level.cumulative_filled,
-                    visible_depth=level.visible_quantity,
-                    intensity=level.intensity,
-                    refill_count=level.refill_count,
-                    confidence=self._calculate_confidence(level),
-                    level=ice_level
-                )
-                self.iceberg_signals.append(signal)
-                self.active_icebergs[price] = signal
+                prev_signal = self.active_icebergs.get(price)
+                prev_level = prev_signal.level if prev_signal else None
+
+                if price not in self.active_icebergs:
+                    # 新冰山
+                    signal = IcebergSignal(
+                        timestamp=datetime.now(),
+                        price=price,
+                        side='BUY',
+                        cumulative_volume=level.cumulative_filled,
+                        visible_depth=level.visible_quantity,
+                        intensity=level.intensity,
+                        refill_count=level.refill_count,
+                        confidence=self._calculate_confidence(level),
+                        level=ice_level
+                    )
+                    self.iceberg_signals.append(signal)
+                    self.active_icebergs[price] = signal
+                    self._log_iceberg_signal(signal)
+                    self.add_iceberg_alert(signal)  # P2-3.1: 发送告警
+                elif prev_level and prev_level != ice_level:
+                    # P2-3.1: 等级变化，更新并发送告警
+                    signal = IcebergSignal(
+                        timestamp=datetime.now(),
+                        price=price,
+                        side='BUY',
+                        cumulative_volume=level.cumulative_filled,
+                        visible_depth=level.visible_quantity,
+                        intensity=level.intensity,
+                        refill_count=level.refill_count,
+                        confidence=self._calculate_confidence(level),
+                        level=ice_level
+                    )
+                    self.active_icebergs[price] = signal
+                    self._log_iceberg_signal(signal)
+                    self.add_iceberg_alert(signal, prev_level)  # 含升级绕过
 
         # 检测卖单冰山
         for price, level in self.ask_levels.items():
-            if level.is_iceberg and price not in self.active_icebergs:
+            if level.is_iceberg:
                 ice_level = level.get_iceberg_level()
-                signal = IcebergSignal(
-                    timestamp=datetime.now(),
-                    price=price,
-                    side='SELL',
-                    cumulative_volume=level.cumulative_filled,
-                    visible_depth=level.visible_quantity,
-                    intensity=level.intensity,
-                    refill_count=level.refill_count,
-                    confidence=self._calculate_confidence(level),
-                    level=ice_level
-                )
-                self.iceberg_signals.append(signal)
-                self.active_icebergs[price] = signal
+                prev_signal = self.active_icebergs.get(price)
+                prev_level = prev_signal.level if prev_signal else None
+
+                if price not in self.active_icebergs:
+                    # 新冰山
+                    signal = IcebergSignal(
+                        timestamp=datetime.now(),
+                        price=price,
+                        side='SELL',
+                        cumulative_volume=level.cumulative_filled,
+                        visible_depth=level.visible_quantity,
+                        intensity=level.intensity,
+                        refill_count=level.refill_count,
+                        confidence=self._calculate_confidence(level),
+                        level=ice_level
+                    )
+                    self.iceberg_signals.append(signal)
+                    self.active_icebergs[price] = signal
+                    self._log_iceberg_signal(signal)
+                    self.add_iceberg_alert(signal)  # P2-3.1: 发送告警
+                elif prev_level and prev_level != ice_level:
+                    # P2-3.1: 等级变化，更新并发送告警
+                    signal = IcebergSignal(
+                        timestamp=datetime.now(),
+                        price=price,
+                        side='SELL',
+                        cumulative_volume=level.cumulative_filled,
+                        visible_depth=level.visible_quantity,
+                        intensity=level.intensity,
+                        refill_count=level.refill_count,
+                        confidence=self._calculate_confidence(level),
+                        level=ice_level
+                    )
+                    self.active_icebergs[price] = signal
+                    self._log_iceberg_signal(signal)
+                    self.add_iceberg_alert(signal, prev_level)  # 含升级绕过
 
         # 更新统计 (所有冰山)
         buy_signals = [s for s in self.iceberg_signals if s.side == 'BUY']
@@ -1184,11 +1639,34 @@ class AlertMonitor:
         await self.initialize()
         self.running = True
 
+        # 连接 WebSocket (如果启用)
+        if self.ws_manager:
+            console.print("[cyan]尝试连接 WebSocket...[/cyan]")
+
+            # P3: 注册健康检查回调
+            self.ws_manager.on('data_stale', lambda d: self._on_health_status_change('STALE', d))
+            self.ws_manager.on('data_recovered', lambda d: self._on_health_status_change('HEALTHY', d))
+            self.ws_manager.on('disconnected', lambda d: self._on_health_status_change('DISCONNECTED', d))
+            self.ws_manager.on('connected', lambda d: self._on_health_status_change('HEALTHY', d))
+
+            ws_connected = await self.ws_manager.connect()
+            if ws_connected:
+                console.print("[green]WebSocket 已连接，使用实时数据[/green]")
+            else:
+                console.print("[yellow]WebSocket 连接失败，使用 REST 模式[/yellow]")
+
+        # 初始化 Discord 通知
+        if self.discord_notifier:
+            await self.discord_notifier.initialize()
+            console.print(f"[dim]Discord 通知已启用 (最低置信度: {CONFIG_DISCORD.get('min_confidence', 50)}%)[/dim]")
+
         # 初始更新
         await self.update_mtf()
         await self.update_derivatives()
 
         counter = 0
+        # WebSocket 模式下使用更短的轮询间隔
+        poll_interval = 1 if (self.ws_manager and self.ws_manager.is_connected) else 5
 
         # 使用 Live 显示，screen=True 可以避免重复打印
         import time
@@ -1205,13 +1683,17 @@ class AlertMonitor:
                         analysis = self.analyze_and_alert(data, event_ts)
                         live.update(self.build_display(analysis))
 
-                    counter += 5
+                    counter += poll_interval
                     if counter >= 60:
-                        await self.update_mtf()
-                        await self.update_derivatives()
+                        # 添加整体超时保护
+                        try:
+                            await asyncio.wait_for(self.update_mtf(), timeout=15.0)
+                            await asyncio.wait_for(self.update_derivatives(), timeout=15.0)
+                        except asyncio.TimeoutError:
+                            console.print("[yellow]⚠ MTF/合约更新整体超时[/yellow]")
                         counter = 0
 
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(poll_interval)
 
                 except asyncio.CancelledError:
                     break
@@ -1224,6 +1706,7 @@ class AlertMonitor:
         self.running = False
 
         # Step C: 强制保存状态 (使用 last_event_ts 保证确定性 - GPT建议)
+        # P2-4: 使用扩展保存
         if self.last_event_ts:
             console.print("[dim]保存状态...[/dim]")
             state = {
@@ -1237,13 +1720,42 @@ class AlertMonitor:
                 'last_score': self.last_score,
                 'last_price': self.current_price,
             }
-            self.state_saver.save(state, self.last_event_ts, force=True)
-            console.print("[green]✓ 状态已保存[/green]")
+            # P2-4: 扩展保存 (含冰山 + 节流)
+            active_icebergs = self._serialize_active_icebergs()
+            self.state_saver.save_extended(
+                state=state,
+                active_icebergs=active_icebergs,
+                throttle_state=self._alert_throttle,
+                current_ts=self.last_event_ts,
+                force=True
+            )
+            ice_count = len(active_icebergs)
+            throttle_count = len(self._alert_throttle)
+            console.print(f"[green]✓ 状态已保存[/green] (冰山:{ice_count}, 节流:{throttle_count})")
         else:
             console.print("[yellow]⚠ 无 event_ts，跳过状态保存[/yellow]")
 
+        # P3: 保存运行元信息
+        if self.run_recorder:
+            self.run_recorder.finalize(metrics={
+                'total_signals': self.iceberg_buy_count + self.iceberg_sell_count,
+                'confirmed_count': self.metrics.confirmed_count,
+                'activity_count': self.metrics.activity_count,
+                'reconnect_count': self.ws_manager.reconnect_count if self.ws_manager else 0,
+                'throttle_count': len(self._alert_throttle),
+            })
+            console.print(f"[dim]Run 元信息已保存: {self.run_recorder.filepath}[/dim]")
+
         # 打印 72 小时验证监控报告
         self.metrics.print_report()
+
+        # 关闭 WebSocket
+        if self.ws_manager:
+            await self.ws_manager.disconnect()
+
+        # 关闭 Discord 通知器
+        if self.discord_notifier:
+            await self.discord_notifier.close()
 
         if self.exchange:
             await self.exchange.close()
@@ -1257,15 +1769,95 @@ async def main():
     parser = argparse.ArgumentParser(description='Flow Radar 综合判断系统')
     parser.add_argument('--symbol', '-s', type=str, default='DOGE/USDT',
                         help='交易对 (默认: DOGE/USDT)')
+    parser.add_argument('--web', action='store_true',
+                        help='启动 Web 仪表板')
+    parser.add_argument('--web-only', action='store_true',
+                        help='仅启动 Web 仪表板 (无终端 UI)')
+    parser.add_argument('--port', type=int, default=8080,
+                        help='Web 服务器端口 (默认: 8080)')
     args = parser.parse_args()
 
     monitor = AlertMonitor(symbol=args.symbol)
 
+    # Web 仪表板模式
+    web_server = None
+    web_runner = None
+
+    if args.web or args.web_only:
+        try:
+            from web.server import DashboardServer
+            from config.settings import CONFIG_WEB
+
+            # 更新端口配置
+            config = CONFIG_WEB.copy()
+            config['port'] = args.port
+
+            web_server = DashboardServer(
+                monitors={args.symbol: monitor},
+                config=config
+            )
+            web_runner = await web_server.start()
+            console.print(f"[green]Web 仪表板: http://localhost:{args.port}[/green]")
+        except ImportError as e:
+            console.print(f"[red]无法启动 Web 服务器: {e}[/red]")
+            console.print("[yellow]请安装 aiohttp: pip install aiohttp[/yellow]")
+
     try:
-        await monitor.run()
+        if args.web_only:
+            # 仅 Web 模式：后台运行监控，无终端 UI
+            console.print("[cyan]Web-only 模式: 终端 UI 已禁用[/cyan]")
+            await monitor.initialize()
+            monitor.running = True
+
+            # 连接 WebSocket
+            if monitor.ws_manager:
+                await monitor.ws_manager.connect()
+
+            # 初始化 Discord
+            if monitor.discord_notifier:
+                await monitor.discord_notifier.initialize()
+
+            # 后台数据更新循环
+            import time
+            counter = 0
+            while monitor.running:
+                try:
+                    event_ts = time.time()
+                    monitor.last_event_ts = event_ts
+                    monitor.metrics.record_tick(event_ts)
+
+                    data = await monitor.fetch_data()
+                    if data:
+                        monitor.analyze_and_alert(data, event_ts)
+
+                    counter += 5
+                    if counter >= 60:
+                        try:
+                            await asyncio.wait_for(monitor.update_mtf(), timeout=15.0)
+                            await asyncio.wait_for(monitor.update_derivatives(), timeout=15.0)
+                        except asyncio.TimeoutError:
+                            pass
+                        counter = 0
+
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    console.print(f"[red]错误: {e}[/red]")
+                    await asyncio.sleep(5)
+        else:
+            # 正常模式：终端 UI + 可选 Web
+            await monitor.run()
+
     except KeyboardInterrupt:
         console.print("\n[yellow]正在关闭...[/yellow]")
     finally:
+        # 关闭 Web 服务器
+        if web_server:
+            await web_server.stop()
+        if web_runner:
+            await web_runner.cleanup()
+
         await monitor.shutdown()
 
 
