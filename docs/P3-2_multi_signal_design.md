@@ -1,7 +1,7 @@
 # P3-2 多维度信号方案设计
 
-**版本**: v1.1
-**日期**: 2026-01-06
+**版本**: v1.2
+**日期**: 2026-01-07
 **状态**: 设计阶段 (不影响当前 72h 验证)
 **依据**: 三方会谈第十六轮/十七轮/二十轮最终共识
 
@@ -9,6 +9,7 @@
 
 | 版本 | 日期 | 修订内容 | 依据 |
 |------|------|---------|------|
+| v1.2 | 2026-01-07 | 明确优先级比较器规则、枚举映射注释、强化架构规范约束 | 三方会谈第二十轮共识最终确认 |
 | v1.1 | 2026-01-06 | 修正优先级规则：(level_rank, type_rank)，添加架构规范约束 | 三方会谈第二十轮共识 |
 | v1.0 | 2026-01-05 | 初版设计文档 | 三方会谈第十六轮/十七轮共识 |
 
@@ -504,31 +505,42 @@ CRITICAL (控制台 + Discord + 声音):
 
 ### 4.1 信号优先级
 
-#### **优先级定义 (修正版 - 三方会谈第二十轮共识)**
+#### **优先级定义 (修正版 - 三方会谈第二十轮共识最终确认)**
 
-**核心规则**: 优先级 sort_key = (level_rank, type_rank)
+**核心规则**:
+```
+优先级 sort_key = (level_rank, type_rank)
+```
 - **先按 level 排序，再按 type 排序**
-- 示例: CRITICAL Iceberg > INFO Liquidation (level 优先于 type)
+- **level 优先于 type** - 不同 level 的信号，level 决定优先级
+- **同 level 时才比较 type** - level 相同时，type 决定优先级
+- **示例**: CRITICAL Iceberg (1, 3) > INFO Liquidation (5, 1)
+  - 虽然 liq 的 type_rank 更高，但 CRITICAL level 压倒一切
 
 **level_rank 枚举映射** (越小优先级越高):
 ```python
 LEVEL_PRIORITY = {
-    'CRITICAL': 1,   # 最高优先 - 严重事件
-    'CONFIRMED': 2,  # 已确认信号
-    'WARNING': 3,    # 警告级别
-    'ACTIVITY': 4,   # 观察级别
-    'INFO': 5,       # 最低优先 - 信息记录
+    'CRITICAL': 1,   # 最高优先 - 严重事件（大额清算、连锁反应）
+    'CONFIRMED': 2,  # 已确认信号（多次验证、置信度高）
+    'WARNING': 3,    # 警告级别（中等风险、需关注）
+    'ACTIVITY': 4,   # 观察级别（单次出现、待确认）
+    'INFO': 5,       # 最低优先 - 信息记录（仅统计、不告警）
 }
 ```
 
 **type_rank 枚举映射** (同 level 时才比较):
 ```python
 TYPE_PRIORITY = {
-    'liq': 1,      # 清算 - 市场风险最高
-    'whale': 2,    # 鲸鱼成交 - 真实资金流
-    'iceberg': 3,  # 冰山订单 - 需验证确认
+    'liq': 1,      # 清算 - 市场风险最高（已发生强平）
+    'whale': 2,    # 鲸鱼成交 - 真实资金流（已成交订单）
+    'iceberg': 3,  # 冰山订单 - 需验证确认（挂单意图）
 }
 ```
+
+**重要说明**:
+- ✅ **level_rank 始终优先**: 任何 CRITICAL 级别的信号都比其他级别的信号优先级高
+- ✅ **type_rank 仅在同 level 时生效**: 只有 level 相同时才比较 type
+- ✅ **数值越小优先级越高**: 1 > 2 > 3 > 4 > 5
 
 **比较器实现**:
 ```python
@@ -1254,82 +1266,205 @@ class ThresholdOptimizer:
 - 所有信号必须记录 confidence_modifier (便于审查)
 - Key 格式必须全局唯一 (支持跨类型去重)
 
-### 7.5 架构规范约束 (三方会谈第二十轮共识)
+### 7.5 架构规范约束 (三方会谈第二十轮共识最终确认)
 
-#### **配置外部化要求**
+本节定义 P3-2 多信号架构的强制性架构规范，确保代码可维护性和一致性。
+
+---
+
+#### **7.5.1 配置外部化要求**
+
+**规范**: 所有优先级映射必须定义在配置文件中，禁止硬编码。
+
+**强制配置位置**: `config/settings.py`
+
 ```python
 # config/settings.py - 强制定义优先级映射
 CONFIG_SIGNAL_PRIORITY = {
     "level_rank": {
-        "CRITICAL": 1,
+        "CRITICAL": 1,   # 最高优先
         "CONFIRMED": 2,
         "WARNING": 3,
         "ACTIVITY": 4,
-        "INFO": 5,
+        "INFO": 5,       # 最低优先
     },
     "type_rank": {
-        "liq": 1,
-        "whale": 2,
-        "iceberg": 3,
+        "liq": 1,        # 清算 - 市场风险最高
+        "whale": 2,      # 鲸鱼成交 - 真实资金流
+        "iceberg": 3,    # 冰山订单 - 需验证确认
     }
 }
 ```
 
-**约束**:
-- ✅ level_rank 和 type_rank 映射**必须**定义在 `config/settings.py`
-- ✅ 便于未来调整优先级而不改动核心代码
-- ❌ **禁止**在检测器内部硬编码优先级值
+**约束条件**:
+- ✅ **MUST**: level_rank 和 type_rank 映射**必须**定义在 `config/settings.py`
+- ✅ **MUST**: 使用字典格式，键为字符串，值为整数
+- ✅ **SHOULD**: 添加注释说明每个级别的含义
+- ❌ **MUST NOT**: 禁止在检测器、管理器、工具函数中硬编码优先级值
+- ❌ **MUST NOT**: 禁止在业务逻辑中使用魔法数字 (如 `if priority == 1`)
 
-#### **比较逻辑原子化要求**
+**目的**:
+- 便于未来调整优先级而不改动核心代码
+- 集中管理优先级配置，避免不一致
+- 提高代码可读性和可维护性
+
+---
+
+#### **7.5.2 比较逻辑原子化要求**
+
+**规范**: 信号优先级比较逻辑必须封装为独立函数，禁止重复实现。
+
+**强制函数位置**: `core/utils.py` 或 `UnifiedSignalManager` 类内部
+
 ```python
-# core/utils.py 或 UnifiedSignalManager
-def compare_signal_priority(signal1: Dict, signal2: Dict) -> int:
+# core/utils.py - 统一比较函数
+from typing import Dict, Tuple
+
+def get_signal_sort_key(signal: Dict) -> Tuple[int, int]:
     """
-    统一信号优先级比较逻辑
+    获取信号排序键 (level_rank, type_rank)
+
+    Args:
+        signal: 信号字典，必须包含 'level' 和 'type' 字段
 
     Returns:
-        -1: signal1 优先级更高
-         0: 优先级相同
-         1: signal2 优先级更高
+        (level_rank, type_rank) 元组，用于 sorted() 函数的 key 参数
+
+    Example:
+        signals.sort(key=get_signal_sort_key)  # 升序排序，最高优先级在前
     """
     from config.settings import CONFIG_SIGNAL_PRIORITY
 
+    level_rank = CONFIG_SIGNAL_PRIORITY['level_rank'].get(signal['level'], 99)
+    type_rank = CONFIG_SIGNAL_PRIORITY['type_rank'].get(signal['type'], 99)
+
+    return (level_rank, type_rank)
+
+
+def compare_signal_priority(signal1: Dict, signal2: Dict) -> int:
+    """
+    比较两个信号的优先级
+
+    Args:
+        signal1: 第一个信号
+        signal2: 第二个信号
+
+    Returns:
+        -1: signal1 优先级更高 (应排在 signal2 前面)
+         0: 优先级相同
+         1: signal2 优先级更高 (应排在 signal1 前面)
+
+    Example:
+        if compare_signal_priority(sig1, sig2) < 0:
+            # sig1 优先级更高，先处理 sig1
+    """
+    from config.settings import CONFIG_SIGNAL_PRIORITY
+
+    # 1. 先比较 level
     level1 = CONFIG_SIGNAL_PRIORITY['level_rank'].get(signal1['level'], 99)
     level2 = CONFIG_SIGNAL_PRIORITY['level_rank'].get(signal2['level'], 99)
 
     if level1 != level2:
         return -1 if level1 < level2 else 1
 
+    # 2. level 相同时，比较 type
     type1 = CONFIG_SIGNAL_PRIORITY['type_rank'].get(signal1['type'], 99)
     type2 = CONFIG_SIGNAL_PRIORITY['type_rank'].get(signal2['type'], 99)
 
     if type1 != type2:
         return -1 if type1 < type2 else 1
 
+    # 3. level 和 type 都相同，优先级相同
     return 0
-
-def get_signal_sort_key(signal: Dict) -> Tuple[int, int]:
-    """获取信号排序键 (level_rank, type_rank)"""
-    from config.settings import CONFIG_SIGNAL_PRIORITY
-    return (
-        CONFIG_SIGNAL_PRIORITY['level_rank'].get(signal['level'], 99),
-        CONFIG_SIGNAL_PRIORITY['type_rank'].get(signal['type'], 99)
-    )
 ```
 
-**约束**:
-- ✅ 比较逻辑**必须**封装为独立函数（`core/utils.py` 或 `UnifiedSignalManager`）
-- ✅ 所有检测器使用统一的 `get_signal_sort_key()` 或 `compare_signal_priority()`
-- ❌ **严禁**在不同检测器中重复书写排序逻辑
-- ❌ **严禁**在业务代码中直接访问 `TYPE_PRIORITY`/`LEVEL_PRIORITY` 字典
+**约束条件**:
+- ✅ **MUST**: 比较逻辑**必须**封装在 `get_signal_sort_key()` 或 `compare_signal_priority()` 函数中
+- ✅ **MUST**: 所有需要排序的地方**必须**调用这两个函数之一
+- ✅ **MUST**: 函数**必须**从 `config.settings` 导入配置，禁止硬编码
+- ❌ **MUST NOT**: 严禁在 IcebergDetector, WhaleTradeDetector, LiquidationMonitor 中重复实现排序逻辑
+- ❌ **MUST NOT**: 严禁在业务代码中直接访问 `TYPE_PRIORITY`/`LEVEL_PRIORITY` 字典
+- ❌ **MUST NOT**: 严禁使用内联 lambda 实现排序逻辑 (如 `sorted(signals, key=lambda s: (s['level'], s['type']))`)
 
-#### **代码审查检查点**
-Phase 1 实施时必须验证:
+**正确示例**:
+```python
+# ✅ 正确 - 使用统一函数
+from core.utils import get_signal_sort_key
+signals.sort(key=get_signal_sort_key)
+
+# ✅ 正确 - 使用比较函数
+from core.utils import compare_signal_priority
+if compare_signal_priority(sig1, sig2) < 0:
+    primary_signal = sig1
+else:
+    primary_signal = sig2
+```
+
+**错误示例**:
+```python
+# ❌ 错误 - 硬编码优先级
+if signal['type'] == 'liq':
+    priority = 1
+elif signal['type'] == 'whale':
+    priority = 2
+
+# ❌ 错误 - 重复实现排序逻辑
+signals.sort(key=lambda s: (LEVEL_MAP[s['level']], TYPE_MAP[s['type']]))
+
+# ❌ 错误 - 直接访问配置字典
+level_rank = CONFIG_SIGNAL_PRIORITY['level_rank'][signal['level']]
+```
+
+---
+
+#### **7.5.3 代码审查检查点 (Phase 1 实施前必须验证)**
+
+Phase 1 实施时，代码审查必须验证以下检查点：
+
+**配置检查**:
 1. ✅ `config/settings.py` 包含 `CONFIG_SIGNAL_PRIORITY` 定义
-2. ✅ `core/utils.py` 或 `UnifiedSignalManager` 包含比较函数
-3. ✅ 所有排序操作调用 `get_signal_sort_key()`
-4. ❌ 不存在硬编码的优先级值 (如 `if type == 'liq': priority = 1`)
-5. ❌ 不存在重复的排序逻辑实现
+2. ✅ `CONFIG_SIGNAL_PRIORITY` 包含 `level_rank` 和 `type_rank` 两个子字典
+3. ✅ 所有 level 和 type 枚举值都有对应的数值映射
+
+**函数检查**:
+4. ✅ `core/utils.py` 包含 `get_signal_sort_key()` 函数
+5. ✅ `core/utils.py` 包含 `compare_signal_priority()` 函数
+6. ✅ 两个函数都从 `config.settings` 导入配置，而非硬编码
+
+**使用检查**:
+7. ✅ 所有排序操作使用 `get_signal_sort_key()` 作为 key 参数
+8. ✅ 所有优先级比较使用 `compare_signal_priority()` 函数
+9. ❌ 不存在硬编码的优先级数值 (使用 grep 搜索 `priority = 1`, `priority = 2` 等)
+10. ❌ 不存在重复的排序逻辑实现 (搜索 lambda 表达式中的 level/type 组合)
+11. ❌ 不存在直接访问 `TYPE_PRIORITY` 或 `LEVEL_PRIORITY` 的代码
+
+**审查命令**:
+```bash
+# 检查硬编码优先级
+grep -rn "priority\s*=\s*[0-9]" core/ --include="*.py"
+
+# 检查重复排序逻辑
+grep -rn "lambda.*level.*type" core/ --include="*.py"
+
+# 检查直接访问字典
+grep -rn "TYPE_PRIORITY\|LEVEL_PRIORITY" core/ --include="*.py" --exclude="utils.py"
+
+# 验证统一函数调用
+grep -rn "get_signal_sort_key\|compare_signal_priority" core/ --include="*.py"
+```
+
+**审查清单**:
+```
+[ ] config/settings.py 定义 CONFIG_SIGNAL_PRIORITY
+[ ] core/utils.py 定义比较函数
+[ ] IcebergDetector 使用统一比较函数
+[ ] WhaleTradeDetector 使用统一比较函数
+[ ] LiquidationMonitor 使用统一比较函数
+[ ] UnifiedSignalManager 使用统一比较函数
+[ ] 无硬编码优先级值
+[ ] 无重复排序逻辑
+[ ] 代码审查通过
+```
 
 ---
 
