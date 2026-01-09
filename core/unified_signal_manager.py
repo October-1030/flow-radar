@@ -499,6 +499,121 @@ class UnifiedSignalManager:
         }
 
 
+    def process_signals_v2(
+        self,
+        signals: List[SignalEvent],
+        price: Optional[float] = None,
+        symbol: Optional[str] = None
+    ) -> Dict:
+        """
+        Phase 2 增强版信号处理流程
+
+        流程:
+        1. 信号融合（填充 related_signals）
+        2. 置信度调整（计算 confidence_modifier）
+        3. 冲突解决（处理 BUY vs SELL）
+        4. 优先级排序
+        5. 降噪去重
+        6. 生成综合建议（可选：布林带环境过滤）
+
+        Args:
+            signals: 原始信号列表
+            price: 当前价格（用于布林带环境评估，可选）
+            symbol: 交易对符号（可选）
+
+        Returns:
+            Dict: {
+                'signals': List[SignalEvent],  # 处理后的信号
+                'advice': Dict,                # 综合建议（来自 BundleAdvisor）
+                'stats': Dict                  # 统计信息
+            }
+
+        Example:
+            >>> manager = UnifiedSignalManager()
+            >>> signals = manager.collect_signals(icebergs=data)
+            >>> result = manager.process_signals_v2(signals, price=0.15080, symbol='DOGE_USDT')
+            >>> print(result['advice']['advice'])
+            'STRONG_BUY'
+        """
+        if not signals:
+            return {
+                'signals': [],
+                'advice': self._no_advice_result(),
+                'stats': self.get_stats()
+            }
+
+        # 导入 Phase 2 模块
+        from core.signal_fusion_engine import SignalFusionEngine
+        from core.confidence_modifier import ConfidenceModifier
+        from core.conflict_resolver import ConflictResolver
+        from core.bundle_advisor import BundleAdvisor
+
+        # 步骤 1: 信号融合（填充 related_signals）
+        fusion_engine = SignalFusionEngine()
+        relations = fusion_engine.batch_find_relations(signals)
+
+        # 将关联结果填充到信号对象
+        for signal in signals:
+            signal.related_signals = relations.get(signal.key, [])
+
+        # 步骤 2: 置信度调整（计算 confidence_modifier）
+        modifier = ConfidenceModifier()
+        modifier.batch_apply_modifiers(signals, relations)
+
+        # 步骤 3: 冲突解决（处理 BUY vs SELL）
+        resolver = ConflictResolver()
+        signals = resolver.resolve_conflicts(signals)
+
+        # 步骤 4: 优先级排序
+        signals = sort_signals_by_priority(signals)
+
+        # 步骤 5: 降噪去重（复用 Phase 1 逻辑）
+        signals = self._deduplicate(signals)
+
+        # 步骤 6: 生成综合建议（支持布林带环境过滤）
+        from config.settings import CONFIG_FEATURES
+        use_bollinger = CONFIG_FEATURES.get('use_bollinger_regime', False)
+
+        advisor = BundleAdvisor(use_bollinger=use_bollinger)
+        advice = advisor.generate_advice(signals, price=price, symbol=symbol)
+
+        # 步骤 7: 更新历史记录
+        self._update_history(signals)
+
+        # 步骤 8: 组合统计信息
+        stats = self.get_stats()
+        stats['advice'] = advice['advice']
+        stats['advice_confidence'] = advice['confidence']
+        stats['fusion_stats'] = fusion_engine.get_stats()
+        stats['conflict_stats'] = resolver.get_stats()
+
+        return {
+            'signals': signals,
+            'advice': advice,
+            'stats': stats
+        }
+
+
+    def _no_advice_result(self) -> Dict:
+        """
+        返回无建议结果（信号不足）
+
+        Returns:
+            空建议字典
+        """
+        return {
+            'advice': 'WATCH',
+            'buy_score': 0.0,
+            'sell_score': 0.0,
+            'weighted_buy': 0.0,
+            'weighted_sell': 0.0,
+            'buy_count': 0,
+            'sell_count': 0,
+            'confidence': 0.0,
+            'reason': '信号不足，无法生成建议。'
+        }
+
+
     def __repr__(self) -> str:
         """字符串表示"""
         stats = self.get_stats()

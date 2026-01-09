@@ -182,7 +182,85 @@ class Secrets:
     BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
     CHAIN_API_KEY = os.getenv("CHAIN_API_KEY", "")
 
+    # Discord Webhook
+    DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
+
     @classmethod
     def validate(cls) -> bool:
         """验证必要的API密钥是否已配置"""
         return bool(cls.BINANCE_API_KEY and cls.BINANCE_API_SECRET)
+
+
+# ==================== WebSocket 实时数据配置 ====================
+CONFIG_WEBSOCKET = {
+    "enabled": True,                           # 是否启用 WebSocket
+    "ws_url": "wss://ws.okx.com:8443/ws/v5/public",  # OKX WebSocket URL
+    "reconnect_delay": 5,                      # 重连延迟（秒）
+    "max_reconnect_attempts": 10,              # 最大重连次数
+    "heartbeat_interval": 25,                  # 心跳间隔（秒），OKX 要求 30s 内
+    "fallback_to_rest": True,                  # 失败时降级到 REST
+    "channels": ["trades", "books5", "tickers"],  # 订阅频道
+}
+
+# ==================== 健康检查配置 (P2-5) ====================
+CONFIG_HEALTH_CHECK = {
+    "enabled": True,                           # 是否启用健康检查
+    "data_stale_threshold": 60,                # 数据过期阈值（秒），超过此时间无数据视为异常
+    "warning_threshold": 30,                   # 预警阈值（秒）
+    "check_interval": 10,                      # 检查间隔（秒）
+    "auto_reconnect_on_stale": True,           # 数据过期时自动重连
+    "max_stale_count_before_alert": 2,         # 连续过期次数后告警
+    "recovery_grace_period": 5,                # 恢复后的观察期（秒）
+}
+
+# ==================== Discord 通知配置 ====================
+CONFIG_DISCORD = {
+    "enabled": False,                          # 是否启用（需配置 webhook）
+    "webhook_url": os.getenv("DISCORD_WEBHOOK_URL", ""),
+    "min_confidence": 50,                      # 最低置信度阈值
+    "rate_limit_per_minute": 10,               # 每分钟最大通知数
+    "embed_colors": {
+        "buy": 0x00FF00,                       # 绿色
+        "sell": 0xFF0000,                      # 红色
+        "warning": 0xFFFF00,                   # 黄色
+        "opportunity": 0x00BFFF,               # 天蓝色
+        "normal": 0x808080,                    # 灰色
+    },
+    "include_fields": True,                    # 是否包含详细字段
+}
+
+# ==================== Web 仪表板配置 ====================
+CONFIG_WEB = {
+    "enabled": False,                          # 默认关闭
+    "host": "0.0.0.0",                         # 监听地址
+    "port": 8080,                              # 监听端口
+    "symbols": ["DOGE/USDT", "BTC/USDT", "ETH/USDT"],  # 支持的币种
+    "update_interval": 1000,                   # 推送间隔（毫秒）
+    "max_history_points": 500,                 # 图表最大数据点
+    "cors_origins": ["http://localhost:3000"], # CORS 允许的来源
+}
+
+# ==================== 告警降噪配置 (P2-3) ====================
+CONFIG_ALERT_THROTTLE = {
+    "enabled": True,                           # 是否启用降噪
+    "cooldown_seconds": 60,                    # 相同告警冷却时间 (秒)
+    "similarity_threshold": 0.8,               # 消息相似度阈值 (0-1)
+    "max_repeat_count": 3,                     # 超过此次数后静默
+    "silent_duration": 300,                    # 静默持续时间 (秒)
+    "level_cooldowns": {                       # 不同级别的冷却时间
+        "info": 30,
+        "warning": 60,
+        "critical": 120,
+        "opportunity": 60,
+    },
+}
+
+# ==================== 功能开关 ====================
+CONFIG_FEATURES = {
+    "websocket_enabled": True,                 # WebSocket 实时数据
+    "discord_enabled": False,                  # Discord 通知
+    "web_dashboard_enabled": False,            # Web 仪表板
+    "chain_analysis_enabled": False,           # 链上分析（待实现）
+    "use_p3_phase2": True,                     # P3-2 Phase 2 多信号综合判断（默认启用）
+    "use_bollinger_regime": False,             # 布林带环境过滤器（默认关闭，测试后启用）
+}
