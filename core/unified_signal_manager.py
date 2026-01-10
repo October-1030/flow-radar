@@ -1,626 +1,529 @@
-#!/usr/bin/env python3
 """
-统一信号管理器 - UnifiedSignalManager
+Flow Radar - Unified Signal Manager
+流动性雷达 - 统一信号管理器
 
-功能：
-1. 从各检测器收集信号（iceberg/whale/liq）
-2. 转换为统一的 SignalEvent 格式
-3. 构建信号关联关系（related_signals）
-4. 按优先级排序（level_rank, type_rank）
-5. 降噪去重
+统一管理多来源信号（iceberg/whale/liq/kgod），实现优先级排序、去重、升级覆盖。
 
-设计原则：
-- 不改动现有检测器（IcebergDetector 等）
-- 作为适配器层，将各检测器的输出转换为 SignalEvent
-- Phase 1 只做信号聚合和关联，不做复杂的融合判断
+核心功能：
+    - 多信号收集（线程安全）
+    - 基于优先级排序（level_rank > type_rank > timestamp）
+    - Key-based 去重（时间窗口内同 key 只保留最高优先级）
+    - 升级覆盖规则（低优先级信号被高优先级替换）
+    - 统计信息查询
 
-作者：Claude Code
-日期：2026-01-08
-版本：v1.0（三方会谈第二十二轮共识 - 工作 2.4）
-参考：docs/P3-2_multi_signal_design.md v1.2
+作者: Claude Code
+日期: 2026-01-10
+工作编号: 2.4
+依赖模块:
+    - core/signal_schema.py (SignalEvent 数据结构)
+    - config/p3_settings.py (优先级配置)
 """
 
-from typing import List, Dict, Optional, Set, Tuple
-from datetime import datetime
+from collections import deque
+from typing import Dict, List, Any, Optional, Tuple
+import threading
 import time
 
-from core.signal_schema import SignalEvent, IcebergSignal, WhaleSignal, LiqSignal
-from config.p3_settings import (
-    sort_signals_by_priority,
-    get_signal_priority,
-    get_dedup_window,
-    SIGNAL_CORRELATION_WINDOW,
-    PRICE_BUCKET_PRECISION
-)
+from core.signal_schema import SignalEvent, SignalSide, SignalLevel, SignalType
+from config.p3_settings import get_sort_key
 
-
-# ==================== 统一信号管理器 ====================
 
 class UnifiedSignalManager:
     """
     统一信号管理器
 
-    负责：
-    1. 收集各类信号（iceberg/whale/liq）
-    2. 转换为 SignalEvent 格式
-    3. 构建 related_signals
-    4. 排序和去重
+    职责：
+        - 收集多来源信号（iceberg/whale/liq/kgod）
+        - 基于 priority (level_rank, type_rank) 排序
+        - Key-based 去重（时间窗口内同 key 只保留优先级最高的）
+        - 升级覆盖规则：低优先级信号被高优先级替换
+        - 线程安全操作
 
-    不负责：
-    - 信号检测逻辑（由各检测器负责）
-    - 告警推送（由 AlertMonitor 负责）
+    内部数据结构：
+        _signals: deque[SignalEvent] - 有序信号队列（最多 maxlen 个）
+        _signal_index: Dict[str, Dict] - 快速查找索引（key -> 信号元数据）
+        _lock: threading.Lock - 线程锁（保证并发安全）
+
+    使用示例：
+        >>> manager = UnifiedSignalManager(maxlen=1000)
+        >>> signal = SignalEvent(...)
+        >>> manager.add_signal(signal)
+        >>> top_signals = manager.get_top_signals(n=5)
+        >>> stats = manager.get_stats()
     """
 
-    def __init__(self):
-        """初始化统一信号管理器"""
-        # 信号历史记录（用于关联和去重）
-        self._signal_history: List[SignalEvent] = []
-        self._signal_keys: Set[str] = set()  # 用于快速查找
-
-        # 统计信息
-        self._stats = {
-            'total_collected': 0,
-            'deduplicated': 0,
-            'correlated': 0,
-        }
-
-
-    def collect_signals(
-        self,
-        icebergs: Optional[List] = None,
-        whales: Optional[List] = None,
-        liqs: Optional[List] = None
-    ) -> List[SignalEvent]:
+    def __init__(self, maxlen: int = 1000):
         """
-        收集所有类型的信号并转换为统一格式
+        初始化信号管理器
 
         Args:
-            icebergs: 冰山信号列表（来自 IcebergDetector）
-            whales: 鲸鱼信号列表（来自 WhaleDetector，预留）
-            liqs: 清算信号列表（来自 LiquidationMonitor，预留）
-
-        Returns:
-            统一格式的信号列表（SignalEvent）
+            maxlen: 信号队列最大长度（超过时自动删除最旧信号）
         """
-        all_signals = []
+        # 有序信号队列（按添加顺序）
+        self._signals: deque[SignalEvent] = deque(maxlen=maxlen)
 
-        # 转换冰山信号
-        if icebergs:
-            for iceberg in icebergs:
-                signal = self._convert_iceberg(iceberg)
-                if signal:
-                    all_signals.append(signal)
-                    self._stats['total_collected'] += 1
+        # 信号索引（key -> 元数据）
+        # value = {
+        #     'signal': SignalEvent,       # 信号对象
+        #     'last_ts': float,            # 最后更新时间
+        #     'suppressed_count': int      # 被抑制的同 key 信号数量
+        # }
+        self._signal_index: Dict[str, Dict[str, Any]] = {}
 
-        # 转换鲸鱼信号（预留）
-        if whales:
-            for whale in whales:
-                signal = self._convert_whale(whale)
-                if signal:
-                    all_signals.append(signal)
-                    self._stats['total_collected'] += 1
+        # 线程锁
+        self._lock: threading.Lock = threading.Lock()
 
-        # 转换清算信号（预留）
-        if liqs:
-            for liq in liqs:
-                signal = self._convert_liq(liq)
-                if signal:
-                    all_signals.append(signal)
-                    self._stats['total_collected'] += 1
+        # 配置
+        self._maxlen = maxlen
 
-        return all_signals
-
-
-    def process_signals(self, signals: List[SignalEvent]) -> List[SignalEvent]:
+    def add_signal(self, signal: SignalEvent) -> None:
         """
-        处理信号：建立关联、排序、去重
+        添加信号到管理器
+
+        逻辑：
+            1. 验证信号（signal.validate()）
+            2. 检查是否存在同 key 信号
+            3. 应用升级覆盖规则：
+               - if new.sort_key < old.sort_key: 替换 old
+               - elif sort_key 相同 and new.confidence > old.confidence: 替换 old
+               - else: 保留 old，suppressed_count += 1
+            4. 添加到 deque 和 index
 
         Args:
-            signals: 原始信号列表
+            signal: SignalEvent 对象
 
-        Returns:
-            处理后的信号列表
+        Raises:
+            ValueError: 如果信号验证失败
         """
-        if not signals:
-            return []
-
-        # 1. 建立信号关联
-        signals = self._build_related_signals(signals)
-
-        # 2. 去重（基于 key 和时间窗口）
-        signals = self._deduplicate(signals)
-
-        # 3. 按优先级排序
-        signals = sort_signals_by_priority(signals)
-
-        # 4. 更新历史记录
-        self._update_history(signals)
-
-        return signals
-
-
-    # ==================== 信号转换适配器 ====================
-
-    def _convert_iceberg(self, iceberg) -> Optional[IcebergSignal]:
-        """
-        转换冰山信号为 SignalEvent 格式
-
-        Args:
-            iceberg: 原始冰山信号对象（可能是 dict 或自定义类）
-
-        Returns:
-            IcebergSignal 对象
-        """
+        # 1. 验证信号
         try:
-            # 如果已经是 IcebergSignal，直接返回
-            if isinstance(iceberg, IcebergSignal):
-                return iceberg
+            signal.validate()
+        except ValueError as e:
+            raise ValueError(f"Signal validation failed: {e}")
 
-            # 如果是字典，转换为 IcebergSignal
-            if isinstance(iceberg, dict):
-                # 兼容旧格式：可能有 'data' 嵌套
-                data = iceberg.get('data', {})
+        # 2. 获取信号的 sort_key
+        new_sort_key = get_sort_key(signal)
+        signal_key = signal.key
 
-                return IcebergSignal(
-                    ts=iceberg.get('ts', time.time()),
-                    symbol=iceberg.get('symbol', data.get('symbol', '')),
-                    side=iceberg.get('side', data.get('side', '')),
-                    level=iceberg.get('level', data.get('level', '')),
-                    confidence=iceberg.get('confidence', data.get('confidence', 0.0)),
-                    price=data.get('price') or iceberg.get('price'),
-                    cumulative_filled=data.get('cumulative_filled', 0.0),
-                    refill_count=data.get('refill_count', 0),
-                    intensity=data.get('intensity', 0.0),
-                    key=iceberg.get('key', self._generate_iceberg_key(iceberg)),
-                    snippet_path=iceberg.get('snippet_path', ''),
-                    offset=iceberg.get('offset', 0),
-                    signal_type='iceberg'
-                )
+        with self._lock:
+            # 3. 检查是否存在同 key 信号
+            if signal_key in self._signal_index:
+                old_entry = self._signal_index[signal_key]
+                old_signal = old_entry['signal']
+                old_sort_key = get_sort_key(old_signal)
 
-            # 如果是自定义对象，尝试读取属性
-            return IcebergSignal(
-                ts=getattr(iceberg, 'ts', time.time()),
-                symbol=getattr(iceberg, 'symbol', ''),
-                side=getattr(iceberg, 'side', ''),
-                level=getattr(iceberg, 'level', ''),
-                confidence=getattr(iceberg, 'confidence', 0.0),
-                price=getattr(iceberg, 'price', None),
-                cumulative_filled=getattr(iceberg, 'cumulative_filled', 0.0),
-                refill_count=getattr(iceberg, 'refill_count', 0),
-                intensity=getattr(iceberg, 'intensity', 0.0),
-                key=getattr(iceberg, 'key', self._generate_iceberg_key(iceberg)),
-                signal_type='iceberg'
-            )
+                # 4. 应用升级覆盖规则
+                should_replace = False
 
-        except Exception as e:
-            print(f"警告: 冰山信号转换失败: {e}")
-            return None
+                # 规则 1: 新信号优先级更高（sort_key 更小）
+                if new_sort_key < old_sort_key:
+                    should_replace = True
+                # 规则 2: 同优先级，新信号置信度更高
+                elif new_sort_key == old_sort_key and signal.confidence > old_signal.confidence:
+                    should_replace = True
 
+                if should_replace:
+                    # 替换旧信号
+                    self._replace_signal(old_signal, signal)
+                    self._signal_index[signal_key] = {
+                        'signal': signal,
+                        'last_ts': signal.ts,
+                        'suppressed_count': old_entry.get('suppressed_count', 0)
+                    }
+                else:
+                    # 保留旧信号，增加抑制计数
+                    old_entry['suppressed_count'] = old_entry.get('suppressed_count', 0) + 1
+            else:
+                # 5. 新 key，直接添加
+                old_len = len(self._signals)
+                self._signals.append(signal)
+                self._signal_index[signal_key] = {
+                    'signal': signal,
+                    'last_ts': signal.ts,
+                    'suppressed_count': 0
+                }
 
-    def _convert_whale(self, whale) -> Optional[WhaleSignal]:
+                # 检测 deque 溢出，清理 index（Critical Bug Fix）
+                if len(self._signals) == old_len and old_len == self._maxlen:
+                    # deque 满了，最旧信号被淘汰，需要同步清理 index
+                    valid_keys = {sig.key for sig in self._signals}
+                    for key in list(self._signal_index.keys()):
+                        if key not in valid_keys:
+                            del self._signal_index[key]
+
+    def _replace_signal(self, old_signal: SignalEvent, new_signal: SignalEvent) -> None:
         """
-        转换鲸鱼信号为 SignalEvent 格式（预留）
+        替换 deque 中的旧信号（优化版本）
 
         Args:
-            whale: 原始鲸鱼信号对象
+            old_signal: 旧信号对象
+            new_signal: 新信号对象
+        """
+        # 重建 deque（对于 maxlen=1000，性能可接受，避免 O(n) 修改）
+        new_signals = deque(maxlen=self._maxlen)
+        replaced = False
+
+        for sig in self._signals:
+            if sig.key == old_signal.key and not replaced:
+                new_signals.append(new_signal)
+                replaced = True
+            else:
+                new_signals.append(sig)
+
+        # 如果未找到（可能被 deque 淘汰），追加到末尾
+        if not replaced:
+            new_signals.append(new_signal)
+
+        self._signals = new_signals
+
+    def get_top_signals(self, n: int = 5) -> List[SignalEvent]:
+        """
+        获取优先级最高的 N 个信号
+
+        排序规则：
+            1. level_rank 升序（CRITICAL=1 最高）
+            2. type_rank 升序（liq=1 最高）
+            3. ts 降序（新信号优先）
+
+        Args:
+            n: 返回信号数量，默认 5
 
         Returns:
-            WhaleSignal 对象
+            排序后的信号列表（最多 n 个）
+
+        Raises:
+            ValueError: 如果 n <= 0
         """
-        try:
-            # 如果已经是 WhaleSignal，直接返回
-            if isinstance(whale, WhaleSignal):
-                return whale
+        if n <= 0:
+            raise ValueError(f"n must be positive, got {n}")
 
-            # 如果是字典
-            if isinstance(whale, dict):
-                return WhaleSignal(
-                    ts=whale.get('ts', time.time()),
-                    symbol=whale.get('symbol', ''),
-                    side=whale.get('side', ''),
-                    level=whale.get('level', ''),
-                    confidence=whale.get('confidence', 0.0),
-                    price=whale.get('price'),
-                    trade_volume=whale.get('trade_volume', 0.0),
-                    trade_count=whale.get('trade_count', 0),
-                    key=whale.get('key', self._generate_whale_key(whale)),
-                    signal_type='whale'
-                )
+        with self._lock:
+            # 复制信号列表（避免锁期间排序）
+            signals = list(self._signals)
 
-            # 预留：从自定义对象转换
-            return None
+        # 按优先级排序
+        sorted_signals = sorted(signals, key=get_sort_key)
 
-        except Exception as e:
-            print(f"警告: 鲸鱼信号转换失败: {e}")
-            return None
+        # 返回 top N
+        return sorted_signals[:n]
 
-
-    def _convert_liq(self, liq) -> Optional[LiqSignal]:
+    def flush(self) -> List[SignalEvent]:
         """
-        转换清算信号为 SignalEvent 格式（预留）
-
-        Args:
-            liq: 原始清算信号对象
+        清空并返回所有信号
 
         Returns:
-            LiqSignal 对象
+            所有信号的列表（排序后）
         """
-        try:
-            # 如果已经是 LiqSignal，直接返回
-            if isinstance(liq, LiqSignal):
-                return liq
+        with self._lock:
+            # 复制信号列表
+            signals = list(self._signals)
 
-            # 如果是字典
-            if isinstance(liq, dict):
-                return LiqSignal(
-                    ts=liq.get('ts', time.time()),
-                    symbol=liq.get('symbol', ''),
-                    side=liq.get('side', ''),
-                    level=liq.get('level', ''),
-                    confidence=liq.get('confidence', 0.0),
-                    price=liq.get('price'),
-                    liquidation_volume=liq.get('liquidation_volume', 0.0),
-                    liquidation_count=liq.get('liquidation_count', 0),
-                    is_cascade=liq.get('is_cascade', False),
-                    key=liq.get('key', self._generate_liq_key(liq)),
-                    signal_type='liq'
-                )
+            # 清空队列和索引
+            self._signals.clear()
+            self._signal_index.clear()
 
-            # 预留：从自定义对象转换
-            return None
+        # 排序后返回
+        return sorted(signals, key=get_sort_key)
 
-        except Exception as e:
-            print(f"警告: 清算信号转换失败: {e}")
-            return None
-
-
-    # ==================== Key 生成器 ====================
-
-    def _generate_iceberg_key(self, signal) -> str:
+    def dedupe_by_key(self, window_seconds: float = 60) -> None:
         """
-        生成冰山信号的 key
+        按 key 去重（时间窗口内）
 
-        格式: iceberg:{symbol}:{side}:{level}:{price_bucket}
-        示例: iceberg:DOGE/USDT:BUY:CONFIRMED:0.1508
-        """
-        symbol = signal.get('symbol', '') if isinstance(signal, dict) else getattr(signal, 'symbol', '')
-        side = signal.get('side', '') if isinstance(signal, dict) else getattr(signal, 'side', '')
-        level = signal.get('level', '') if isinstance(signal, dict) else getattr(signal, 'level', '')
-        price = signal.get('price') if isinstance(signal, dict) else getattr(signal, 'price', None)
-
-        if price:
-            price_bucket = round(price, PRICE_BUCKET_PRECISION)
-        else:
-            price_bucket = 0.0
-
-        return f"iceberg:{symbol}:{side}:{level}:{price_bucket}"
-
-
-    def _generate_whale_key(self, signal) -> str:
-        """
-        生成鲸鱼信号的 key
-
-        格式: whale:{symbol}:{side}:{level}:{time_bucket}
-        示例: whale:DOGE/USDT:BUY:CONFIRMED:2026-01-08T10:30
-        """
-        symbol = signal.get('symbol', '')
-        side = signal.get('side', '')
-        level = signal.get('level', '')
-        ts = signal.get('ts', time.time())
-
-        # 5 分钟时间桶
-        dt = datetime.fromtimestamp(ts)
-        time_bucket = dt.replace(minute=(dt.minute // 5) * 5, second=0, microsecond=0)
-        time_str = time_bucket.strftime('%Y-%m-%dT%H:%M')
-
-        return f"whale:{symbol}:{side}:{level}:{time_str}"
-
-
-    def _generate_liq_key(self, signal) -> str:
-        """
-        生成清算信号的 key
-
-        格式: liq:{symbol}:{side}:{level}:market
-        示例: liq:DOGE/USDT:SELL:CRITICAL:market
-        """
-        symbol = signal.get('symbol', '')
-        side = signal.get('side', '')
-        level = signal.get('level', '')
-
-        return f"liq:{symbol}:{side}:{level}:market"
-
-
-    # ==================== 信号关联 ====================
-
-    def _build_related_signals(self, signals: List[SignalEvent]) -> List[SignalEvent]:
-        """
-        构建信号关联关系
-
-        关联规则：
-        1. 时间窗口内（默认 5 分钟）
-        2. 同一交易对（symbol）
-        3. 同一方向（side）或反向（可选）
+        逻辑：
+            1. 遍历 _signal_index
+            2. 如果 last_ts < (now - window_seconds)：从 index 中移除
+            3. 同时从 deque 中移除过期信号
 
         Args:
-            signals: 信号列表
+            window_seconds: 时间窗口（秒），默认 60
 
-        Returns:
-            添加了 related_signals 的信号列表
+        Raises:
+            ValueError: 如果 window_seconds <= 0
         """
-        if not signals:
-            return signals
+        if window_seconds <= 0:
+            raise ValueError(f"window_seconds must be positive, got {window_seconds}")
 
-        # 按时间排序
-        signals_sorted = sorted(signals, key=lambda s: s.ts)
+        now = time.time()
+        cutoff_time = now - window_seconds
 
-        # 为每个信号查找相关信号
-        for i, signal in enumerate(signals_sorted):
-            related_keys = []
+        with self._lock:
+            # 1. 找出过期的 key
+            expired_keys = []
+            for key, entry in self._signal_index.items():
+                if entry['last_ts'] < cutoff_time:
+                    expired_keys.append(key)
 
-            # 向前查找（时间窗口内的历史信号）
-            for prev_signal in reversed(self._signal_history[-50:]):  # 只看最近 50 个
-                if signal.ts - prev_signal.ts > SIGNAL_CORRELATION_WINDOW:
-                    break  # 超出时间窗口
+            # 2. 从 index 中移除过期 key
+            for key in expired_keys:
+                del self._signal_index[key]
 
-                if self._is_related(signal, prev_signal):
-                    related_keys.append(prev_signal.key)
+            # 3. 从 deque 中移除过期信号
+            if expired_keys:
+                # 创建新 deque，只保留未过期信号
+                new_signals = deque(maxlen=self._maxlen)
+                for signal in self._signals:
+                    if signal.key not in expired_keys:
+                        new_signals.append(signal)
+                self._signals = new_signals
 
-            # 向后查找（当前批次的后续信号）
-            for j in range(i + 1, len(signals_sorted)):
-                next_signal = signals_sorted[j]
-
-                if next_signal.ts - signal.ts > SIGNAL_CORRELATION_WINDOW:
-                    break  # 超出时间窗口
-
-                if self._is_related(signal, next_signal):
-                    related_keys.append(next_signal.key)
-
-            # 更新 related_signals
-            if related_keys:
-                signal.related_signals = list(set(related_keys))  # 去重
-                self._stats['correlated'] += 1
-
-        return signals_sorted
-
-
-    def _is_related(self, signal1: SignalEvent, signal2: SignalEvent) -> bool:
-        """
-        判断两个信号是否相关
-
-        Args:
-            signal1: 信号 1
-            signal2: 信号 2
-
-        Returns:
-            True: 相关
-            False: 不相关
-        """
-        # 同一信号，不关联
-        if signal1.key == signal2.key:
-            return False
-
-        # 不同交易对，不关联
-        if signal1.symbol != signal2.symbol:
-            return False
-
-        # 相同方向，可能关联
-        if signal1.side == signal2.side:
-            return True
-
-        # 反向信号，也可能关联（例如：买卖压力对冲）
-        # Phase 1 先简化，只关联同向信号
-        return False
-
-
-    # ==================== 降噪去重 ====================
-
-    def _deduplicate(self, signals: List[SignalEvent]) -> List[SignalEvent]:
-        """
-        降噪去重
-
-        去重规则：
-        1. 相同 key 的信号
-        2. 时间窗口内（根据 level 决定）
-
-        Args:
-            signals: 信号列表
-
-        Returns:
-            去重后的信号列表
-        """
-        if not signals:
-            return signals
-
-        unique_signals = []
-        seen_keys = {}  # key -> latest_ts
-
-        for signal in signals:
-            # 获取该级别的去重时间窗口
-            dedup_window = get_dedup_window(signal.level)
-
-            # 检查是否重复
-            if signal.key in seen_keys:
-                last_ts = seen_keys[signal.key]
-
-                # 在去重窗口内，跳过
-                if signal.ts - last_ts < dedup_window:
-                    self._stats['deduplicated'] += 1
-                    continue
-
-            # 不重复，添加到结果
-            unique_signals.append(signal)
-            seen_keys[signal.key] = signal.ts
-
-        return unique_signals
-
-
-    def _update_history(self, signals: List[SignalEvent]):
-        """
-        更新信号历史记录
-
-        Args:
-            signals: 新信号列表
-        """
-        self._signal_history.extend(signals)
-        self._signal_keys.update(s.key for s in signals)
-
-        # 保留最近 1000 个信号（避免内存溢出）
-        if len(self._signal_history) > 1000:
-            removed = self._signal_history[:len(self._signal_history) - 1000]
-            self._signal_history = self._signal_history[-1000:]
-
-            # 更新 key 集合
-            self._signal_keys -= {s.key for s in removed}
-
-
-    # ==================== 工具方法 ====================
-
-    def get_stats(self) -> Dict[str, int]:
+    def get_stats(self) -> Dict[str, Any]:
         """
         获取统计信息
 
         Returns:
-            统计字典
+            {
+                'total_signals': int,            # 总信号数
+                'unique_keys': int,              # 唯一 key 数量
+                'suppressed_total': int,         # 总抑制数
+                'by_level': Dict[str, int],      # 按级别分组统计
+                'by_type': Dict[str, int],       # 按类型分组统计
+                'by_side': Dict[str, int]        # 按方向分组统计
+            }
         """
+        with self._lock:
+            total_signals = len(self._signals)
+            unique_keys = len(self._signal_index)
+
+            # 计算总抑制数
+            suppressed_total = sum(
+                entry.get('suppressed_count', 0)
+                for entry in self._signal_index.values()
+            )
+
+            # 按级别统计
+            by_level: Dict[str, int] = {}
+            for signal in self._signals:
+                level = signal.level.value if isinstance(signal.level, SignalLevel) else signal.level
+                by_level[level] = by_level.get(level, 0) + 1
+
+            # 按类型统计
+            by_type: Dict[str, int] = {}
+            for signal in self._signals:
+                sig_type = signal.signal_type.value if isinstance(signal.signal_type, SignalType) else signal.signal_type
+                by_type[sig_type] = by_type.get(sig_type, 0) + 1
+
+            # 按方向统计
+            by_side: Dict[str, int] = {}
+            for signal in self._signals:
+                side = signal.side.value if isinstance(signal.side, SignalSide) else signal.side
+                by_side[side] = by_side.get(side, 0) + 1
+
         return {
-            **self._stats,
-            'history_size': len(self._signal_history),
+            'total_signals': total_signals,
+            'unique_keys': unique_keys,
+            'suppressed_total': suppressed_total,
+            'by_level': by_level,
+            'by_type': by_type,
+            'by_side': by_side
         }
 
+    # ==================== 可选方法（Phase 2 功能预留） ====================
 
-    def clear_history(self):
-        """清空历史记录"""
-        self._signal_history.clear()
-        self._signal_keys.clear()
-        self._stats = {
-            'total_collected': 0,
-            'deduplicated': 0,
-            'correlated': 0,
-        }
-
-
-    def process_signals_v2(
-        self,
-        signals: List[SignalEvent],
-        price: Optional[float] = None,
-        symbol: Optional[str] = None
-    ) -> Dict:
+    def cleanup_expired(self, max_age_seconds: float = 300) -> int:
         """
-        Phase 2 增强版信号处理流程
-
-        流程:
-        1. 信号融合（填充 related_signals）
-        2. 置信度调整（计算 confidence_modifier）
-        3. 冲突解决（处理 BUY vs SELL）
-        4. 优先级排序
-        5. 降噪去重
-        6. 生成综合建议（可选：布林带环境过滤）
+        清理过期信号
 
         Args:
-            signals: 原始信号列表
-            price: 当前价格（用于布林带环境评估，可选）
-            symbol: 交易对符号（可选）
+            max_age_seconds: 信号最大保留时间（秒）
 
         Returns:
-            Dict: {
-                'signals': List[SignalEvent],  # 处理后的信号
-                'advice': Dict,                # 综合建议（来自 BundleAdvisor）
-                'stats': Dict                  # 统计信息
-            }
-
-        Example:
-            >>> manager = UnifiedSignalManager()
-            >>> signals = manager.collect_signals(icebergs=data)
-            >>> result = manager.process_signals_v2(signals, price=0.15080, symbol='DOGE_USDT')
-            >>> print(result['advice']['advice'])
-            'STRONG_BUY'
+            清理的信号数量
         """
-        if not signals:
-            return {
-                'signals': [],
-                'advice': self._no_advice_result(),
-                'stats': self.get_stats()
-            }
+        pass
 
-        # 导入 Phase 2 模块
-        from core.signal_fusion_engine import SignalFusionEngine
-        from core.confidence_modifier import ConfidenceModifier
-        from core.conflict_resolver import ConflictResolver
-        from core.bundle_advisor import BundleAdvisor
-
-        # 步骤 1: 信号融合（填充 related_signals）
-        fusion_engine = SignalFusionEngine()
-        relations = fusion_engine.batch_find_relations(signals)
-
-        # 将关联结果填充到信号对象
-        for signal in signals:
-            signal.related_signals = relations.get(signal.key, [])
-
-        # 步骤 2: 置信度调整（计算 confidence_modifier）
-        modifier = ConfidenceModifier()
-        modifier.batch_apply_modifiers(signals, relations)
-
-        # 步骤 3: 冲突解决（处理 BUY vs SELL）
-        resolver = ConflictResolver()
-        signals = resolver.resolve_conflicts(signals)
-
-        # 步骤 4: 优先级排序
-        signals = sort_signals_by_priority(signals)
-
-        # 步骤 5: 降噪去重（复用 Phase 1 逻辑）
-        signals = self._deduplicate(signals)
-
-        # 步骤 6: 生成综合建议（支持布林带环境过滤）
-        from config.settings import CONFIG_FEATURES
-        use_bollinger = CONFIG_FEATURES.get('use_bollinger_regime', False)
-
-        advisor = BundleAdvisor(use_bollinger=use_bollinger)
-        advice = advisor.generate_advice(signals, price=price, symbol=symbol)
-
-        # 步骤 7: 更新历史记录
-        self._update_history(signals)
-
-        # 步骤 8: 组合统计信息
-        stats = self.get_stats()
-        stats['advice'] = advice['advice']
-        stats['advice_confidence'] = advice['confidence']
-        stats['fusion_stats'] = fusion_engine.get_stats()
-        stats['conflict_stats'] = resolver.get_stats()
-
-        return {
-            'signals': signals,
-            'advice': advice,
-            'stats': stats
-        }
-
-
-    def _no_advice_result(self) -> Dict:
+    def bundle_related_signals(self, window_ms: int = 500) -> List[List[SignalEvent]]:
         """
-        返回无建议结果（信号不足）
+        聚合相关信号（时间窗口内）
+
+        Args:
+            window_ms: 时间窗口（毫秒）
 
         Returns:
-            空建议字典
+            信号组列表（每组是时间相近的信号）
         """
-        return {
-            'advice': 'WATCH',
-            'buy_score': 0.0,
-            'sell_score': 0.0,
-            'weighted_buy': 0.0,
-            'weighted_sell': 0.0,
-            'buy_count': 0,
-            'sell_count': 0,
-            'confidence': 0.0,
-            'reason': '信号不足，无法生成建议。'
-        }
+        pass
+
+    def apply_confidence_modifiers(self) -> None:
+        """
+        应用置信度调整器（Phase 2 功能预留）
+        """
+        pass
+
+    # ==================== 辅助方法 ====================
+
+    def get_signal_by_key(self, key: str) -> Optional[SignalEvent]:
+        """
+        根据 key 获取信号
+
+        Args:
+            key: 信号的唯一标识符
+
+        Returns:
+            信号对象，如果不存在则返回 None
+        """
+        with self._lock:
+            entry = self._signal_index.get(key)
+            return entry['signal'] if entry else None
+
+    def contains_key(self, key: str) -> bool:
+        """
+        检查是否存在指定 key 的信号
+
+        Args:
+            key: 信号的唯一标识符
+
+        Returns:
+            True if key exists, False otherwise
+        """
+        with self._lock:
+            return key in self._signal_index
+
+    def size(self) -> int:
+        """
+        获取当前信号数量
+
+        Returns:
+            信号队列中的信号数量
+        """
+        with self._lock:
+            return len(self._signals)
+
+    def clear(self) -> None:
+        """
+        清空所有信号（不返回）
+        """
+        with self._lock:
+            self._signals.clear()
+            self._signal_index.clear()
+
+    def get_suppressed_count(self, key: str) -> int:
+        """
+        获取指定 key 的抑制计数
+
+        Args:
+            key: 信号的唯一标识符
+
+        Returns:
+            抑制计数，如果 key 不存在则返回 0
+        """
+        with self._lock:
+            entry = self._signal_index.get(key)
+            return entry.get('suppressed_count', 0) if entry else 0
 
 
-    def __repr__(self) -> str:
-        """字符串表示"""
-        stats = self.get_stats()
-        return (
-            f"UnifiedSignalManager("
-            f"collected={stats['total_collected']}, "
-            f"deduplicated={stats['deduplicated']}, "
-            f"correlated={stats['correlated']}, "
-            f"history={stats['history_size']})"
-        )
+# ==================== 使用示例 ====================
+
+def _example_usage():
+    """使用示例（供文档参考）"""
+    print("=" * 70)
+    print("UnifiedSignalManager - 使用示例".center(70))
+    print("=" * 70)
+
+    # 1. 创建管理器
+    manager = UnifiedSignalManager(maxlen=100)
+    print("\n1. 创建管理器")
+    print(f"   初始状态: {manager.size()} 个信号")
+
+    # 2. 添加信号
+    print("\n2. 添加信号")
+
+    # 场景 1: 添加低优先级信号
+    signal1 = SignalEvent(
+        ts=1000.0,
+        symbol="DOGE_USDT",
+        side=SignalSide.BUY,
+        level=SignalLevel.ACTIVITY,
+        confidence=65.0,
+        price=0.15,
+        signal_type=SignalType.ICEBERG,
+        key="iceberg:DOGE_USDT:BUY:ACTIVITY:price_0.15"
+    )
+    manager.add_signal(signal1)
+    print(f"   添加 ACTIVITY 信号: {signal1.key}")
+    print(f"   当前信号数: {manager.size()}")
+
+    # 场景 2: 添加高优先级信号（不同 key，不会替换）
+    signal2 = SignalEvent(
+        ts=1001.0,
+        symbol="DOGE_USDT",
+        side=SignalSide.BUY,
+        level=SignalLevel.CONFIRMED,
+        confidence=85.0,
+        price=0.15,
+        signal_type=SignalType.ICEBERG,
+        key="iceberg:DOGE_USDT:BUY:CONFIRMED:price_0.15"
+    )
+    manager.add_signal(signal2)
+    print(f"   添加 CONFIRMED 信号: {signal2.key}")
+    print(f"   当前信号数: {manager.size()}")
+
+    # 场景 3: 添加不同类型信号
+    signal3 = SignalEvent(
+        ts=1002.0,
+        symbol="BTC_USDT",
+        side=SignalSide.SELL,
+        level=SignalLevel.CRITICAL,
+        confidence=95.0,
+        price=42000.0,
+        signal_type=SignalType.LIQ,
+        key="liq:BTC_USDT:SELL:CRITICAL:price_42000"
+    )
+    manager.add_signal(signal3)
+    print(f"   添加 CRITICAL/LIQ 信号: {signal3.key}")
+    print(f"   当前信号数: {manager.size()}")
+
+    # 场景 4: 添加低优先级信号（同 key，应被抑制）
+    # 注意：使用旧时间戳，这样 sort_key 会更大（优先级更低）
+    signal4 = SignalEvent(
+        ts=999.0,  # 旧时间戳，sort_key = (1, 1, -999.0) > (1, 1, -1002.0)
+        symbol="BTC_USDT",
+        side=SignalSide.SELL,
+        level=SignalLevel.CRITICAL,
+        confidence=90.0,  # 置信度更低
+        price=42000.0,
+        signal_type=SignalType.LIQ,
+        key="liq:BTC_USDT:SELL:CRITICAL:price_42000"
+    )
+    manager.add_signal(signal4)
+    print(f"   添加重复 CRITICAL/LIQ 信号（旧时间戳+低置信度）")
+    print(f"   当前信号数: {manager.size()} (应保持不变)")
+    print(f"   抑制计数: {manager.get_suppressed_count(signal3.key)}")
+
+    # 3. 获取 top 信号
+    print("\n3. 获取优先级最高的 5 个信号")
+    top_signals = manager.get_top_signals(n=5)
+    for i, sig in enumerate(top_signals, 1):
+        level_rank, type_rank, neg_ts = get_sort_key(sig)
+        print(f"   {i}. [{sig.level.value:9}] {sig.signal_type.value:8} "
+              f"| confidence={sig.confidence:.1f}% "
+              f"| rank=({level_rank}, {type_rank})")
+
+    # 4. 统计信息
+    print("\n4. 统计信息")
+    stats = manager.get_stats()
+    print(f"   总信号数: {stats['total_signals']}")
+    print(f"   唯一 key 数: {stats['unique_keys']}")
+    print(f"   总抑制数: {stats['suppressed_total']}")
+    print(f"   按级别: {stats['by_level']}")
+    print(f"   按类型: {stats['by_type']}")
+    print(f"   按方向: {stats['by_side']}")
+
+    # 5. 去重测试（模拟时间流逝）
+    print("\n5. 去重测试（窗口 = 2 秒）")
+    print(f"   去重前信号数: {manager.size()}")
+    time.sleep(0.1)  # 模拟时间流逝
+    manager.dedupe_by_key(window_seconds=2.0)  # 窗口 2 秒，信号 ts=1000-1003，都应保留
+    print(f"   去重后信号数: {manager.size()}")
+
+    # 6. 清空
+    print("\n6. 清空信号")
+    flushed = manager.flush()
+    print(f"   清空并返回 {len(flushed)} 个信号（排序后）")
+    print(f"   清空后信号数: {manager.size()}")
+
+    print("\n" + "=" * 70)
+
+
+if __name__ == "__main__":
+    # 运行使用示例
+    _example_usage()
