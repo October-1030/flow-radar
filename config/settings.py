@@ -263,4 +263,5 @@ CONFIG_FEATURES = {
     "chain_analysis_enabled": False,           # 链上分析（待实现）
     "use_p3_phase2": True,                     # P3-2 Phase 2 多信号综合判断（默认启用）
     "use_bollinger_regime": False,             # 布林带环境过滤器（默认关闭，测试后启用）
+    "use_kgod_radar": False,                   # K神战法 2.0 雷达（Phase 2 集成，默认关闭）
 }

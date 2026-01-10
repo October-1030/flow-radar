@@ -55,6 +55,16 @@ from core.discord_notifier import DiscordNotifier, AlertMessage
 from core.price_level import PriceLevel, IcebergLevel, CONFIG_PRICE_LEVEL
 from core.run_metadata import RunMetadataRecorder
 
+# P3-2 Phase 2: Multi-signal judgment system
+if CONFIG_FEATURES.get("use_p3_phase2", False):
+    from core.unified_signal_manager import UnifiedSignalManager
+    from core.bundle_advisor import BundleAdvisor
+
+# K神战法 2.0 (Phase 2 集成)
+KGOD_ENABLED = CONFIG_FEATURES.get("use_kgod_radar", False)
+if KGOD_ENABLED:
+    from core.kgod_radar import create_kgod_radar, OrderFlowSnapshot, SignalStage, KGodSignal
+
 console = Console()
 
 
@@ -268,6 +278,18 @@ class AlertMonitor:
         self.run_recorder = RunMetadataRecorder(symbols=[self.symbol])
         self.run_recorder.save()
         console.print(f"[dim]Run ID: {self.run_recorder.run_id}[/dim]")
+
+        # ========== K神战法 2.0 雷达 ==========
+        self.kgod_radar = None
+        self.use_kgod = KGOD_ENABLED
+        if self.use_kgod:
+            self.kgod_radar = create_kgod_radar(symbol=self.symbol)
+            console.print(f"[cyan]K神战法 2.0 雷达已启用[/cyan]")
+
+        # K神雷达历史数据（用于计算 Delta斜率）
+        self.price_history = []          # 最近价格历史
+        self.cvd_history = []            # 最近 CVD 历史
+        self.last_cvd = 0.0              # 上次 CVD 值
 
     def _restore_state(self):
         """Step C: 启动时恢复状态 (P2-4: 扩展版)"""
@@ -947,6 +969,184 @@ class AlertMonitor:
             }
             self.event_logger.log_iceberg(iceberg_data, signal.timestamp.timestamp())
 
+    def _update_kgod_radar(self, price: float, indicators, event_ts: float):
+        """
+        K神战法 2.0 雷达更新（简化版 OrderFlowSnapshot 构建）
+
+        Args:
+            price: 当前价格
+            indicators: 指标结果（IndicatorResult）
+            event_ts: 事件时间戳
+
+        Returns:
+            KGodSignal 或 None
+        """
+        if not self.kgod_radar:
+            return None
+
+        # 更新价格历史（用于计算 Delta斜率）
+        self.price_history.append(price)
+        if len(self.price_history) > 20:
+            self.price_history.pop(0)
+
+        # 更新 CVD 历史
+        current_cvd = self.cvd_total
+        cvd_delta_5s = current_cvd - self.last_cvd if self.last_cvd != 0 else 0
+        self.cvd_history.append(current_cvd)
+        if len(self.cvd_history) > 20:
+            self.cvd_history.pop(0)
+        self.last_cvd = current_cvd
+
+        # 计算 Delta斜率（简化：最近10个点的线性回归斜率）
+        delta_slope_10s = 0.0
+        if len(self.cvd_history) >= 10:
+            recent_cvd = self.cvd_history[-10:]
+            # 简单线性回归斜率
+            n = len(recent_cvd)
+            x_mean = (n - 1) / 2
+            y_mean = sum(recent_cvd) / n
+            numerator = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(recent_cvd))
+            denominator = sum((i - x_mean) ** 2 for i in range(n))
+            if denominator > 0:
+                delta_slope_10s = numerator / denominator
+
+        # 计算失衡（OBI转换为失衡比例）
+        imbalance_1s = 0.5 + indicators.obi / 2  # OBI范围[-1,1] → 失衡范围[0,1]
+
+        # 获取冰山强度（基于当前活跃冰山）
+        iceberg_intensity = 0.0
+        refill_count = 0
+        if self.active_icebergs:
+            # 取最强冰山的强度
+            strongest_iceberg = max(self.active_icebergs.values(),
+                                   key=lambda sig: sig.intensity if hasattr(sig, 'intensity') else 0,
+                                   default=None)
+            if strongest_iceberg:
+                iceberg_intensity = strongest_iceberg.intensity if hasattr(strongest_iceberg, 'intensity') else 0
+                refill_count = strongest_iceberg.refill_count if hasattr(strongest_iceberg, 'refill_count') else 0
+
+        # 计算价格在布林带轨道的接受时间（简化：使用历史数据估算）
+        acceptance_above_upper_s = 0.0
+        acceptance_below_lower_s = 0.0
+        # 注意：这个需要布林带数据，我们暂时跳过，让 KGodRadar 自己计算
+
+        # 构建 OrderFlowSnapshot
+        order_flow = OrderFlowSnapshot(
+            delta_5s=cvd_delta_5s,                      # 5秒 CVD 变化
+            delta_slope_10s=delta_slope_10s,            # 10秒 Delta 斜率
+            imbalance_1s=imbalance_1s,                  # 1秒失衡（从OBI计算）
+            absorption_ask=0.5,                         # 吸收率（暂时使用中性值）
+            absorption_bid=0.5,
+            sweep_score_5s=0.0,                         # 扫单得分（暂时未实现）
+            iceberg_intensity=iceberg_intensity,        # 冰山强度
+            refill_count=refill_count,                  # 补单次数
+            acceptance_above_upper_s=acceptance_above_upper_s,
+            acceptance_below_lower_s=acceptance_below_lower_s
+        )
+
+        # 更新雷达
+        try:
+            signal = self.kgod_radar.update(price, order_flow, event_ts)
+
+            # 如果有信号，处理告警
+            if signal:
+                self._handle_kgod_signal(signal)
+
+            return signal
+        except Exception as e:
+            console.print(f"[red]K神雷达更新失败: {e}[/red]")
+            return None
+
+    def _handle_kgod_signal(self, signal: 'KGodSignal'):
+        """
+        处理 K神信号（发送 Discord 告警）
+
+        Args:
+            signal: KGodSignal 对象
+        """
+        if not signal:
+            return
+
+        # 根据信号级别决定是否告警
+        should_alert = False
+        alert_level = "normal"
+
+        if signal.stage == SignalStage.KGOD_CONFIRM:
+            # K神确认：高优先级告警
+            should_alert = signal.confidence >= 70
+            alert_level = "opportunity"
+        elif signal.stage == SignalStage.EARLY_CONFIRM:
+            # 早期确认：中优先级告警
+            should_alert = signal.confidence >= 60
+            alert_level = "normal"
+        elif signal.stage == SignalStage.BAN:
+            # 走轨风险：立即告警
+            should_alert = True
+            alert_level = "warning"
+        elif signal.stage == SignalStage.PRE_ALERT:
+            # 预警：低优先级，不告警（除非置信度很高）
+            should_alert = signal.confidence >= 50
+            alert_level = "normal"
+
+        if should_alert:
+            self.add_alert(
+                self._format_kgod_title(signal),
+                self._format_kgod_message(signal),
+                alert_level
+            )
+
+    def _format_kgod_title(self, signal: 'KGodSignal') -> str:
+        """格式化 K神信号标题"""
+        stage_icons = {
+            SignalStage.PRE_ALERT: "💡",
+            SignalStage.EARLY_CONFIRM: "📢",
+            SignalStage.KGOD_CONFIRM: "🎯",
+            SignalStage.BAN: "🚫"
+        }
+        side_text = "做多" if signal.side.value == "BUY" else "做空"
+        icon = stage_icons.get(signal.stage, "📊")
+
+        if signal.stage == SignalStage.BAN:
+            return f"{icon} K神-走轨风险"
+        else:
+            return f"{icon} K神-{side_text}信号"
+
+    def _format_kgod_message(self, signal: 'KGodSignal') -> str:
+        """格式化 K神信号消息"""
+        stage_names = {
+            SignalStage.PRE_ALERT: "预警",
+            SignalStage.EARLY_CONFIRM: "早期确认",
+            SignalStage.KGOD_CONFIRM: "K神确认",
+            SignalStage.BAN: "禁入/平仓"
+        }
+
+        stage_name = stage_names.get(signal.stage, "未知")
+        side_text = "看多" if signal.side.value == "BUY" else "看空"
+
+        # 构建消息
+        lines = [f"级别: {stage_name}"]
+
+        if signal.stage != SignalStage.BAN:
+            lines.append(f"方向: {side_text}")
+            lines.append(f"置信度: {signal.confidence:.1f}%")
+
+        # 添加触发原因（最多3条）
+        if signal.reasons:
+            reasons_text = ", ".join(signal.reasons[:3])
+            lines.append(f"原因: {reasons_text}")
+
+        # BAN 信号特殊处理
+        if signal.stage == SignalStage.BAN:
+            ban_count = self.kgod_radar.get_ban_count() if self.kgod_radar else 0
+            lines.append(f"BAN累计: {ban_count} 条")
+            if self.kgod_radar:
+                if self.kgod_radar.should_force_exit():
+                    lines.append("⛔ 建议: 强制平仓")
+                elif self.kgod_radar.should_ban_entry():
+                    lines.append("🚫 建议: 禁止开仓")
+
+        return " | ".join(lines)
+
     def detect_icebergs(self):
         """检测冰山单 (Step E: 区分 Activity vs Confirmed) + P2-3.1 告警"""
         # 检测买单冰山
@@ -1046,6 +1246,99 @@ class AlertMonitor:
         self.confirmed_sell_count = len(confirmed_sell)
         self.confirmed_buy_volume = sum(s.cumulative_volume for s in confirmed_buy)
         self.confirmed_sell_volume = sum(s.cumulative_volume for s in confirmed_sell)
+
+        # P3-2 Phase 2: Multi-signal judgment and Bundle alert
+        if CONFIG_FEATURES.get("use_p3_phase2", False) and self.iceberg_signals:
+            self._process_phase2_bundle()
+
+    def _process_phase2_bundle(self):
+        """
+        P3-2 Phase 2: 多信号综合判断与 Bundle 告警
+
+        功能:
+        1. 转换 IcebergSignal 为统一格式
+        2. 使用 UnifiedSignalManager 处理（融合、调整、冲突、建议）
+        3. 发送 Bundle 综合告警
+        """
+        try:
+            # 初始化 Phase 2 组件
+            manager = UnifiedSignalManager()
+
+            # 转换 IcebergSignal 为字典格式
+            iceberg_dicts = []
+            for signal in self.iceberg_signals:
+                iceberg_dict = {
+                    'type': 'iceberg',
+                    'symbol': self.symbol.replace('/', '_'),
+                    'ts': signal.timestamp.timestamp(),
+                    'side': signal.side,
+                    'level': signal.level.name if hasattr(signal.level, 'name') else str(signal.level),
+                    'price': signal.price,
+                    'confidence': signal.confidence,
+                    'intensity': signal.intensity,
+                    'refill_count': signal.refill_count,
+                    'cumulative_filled': signal.cumulative_volume,
+                    'visible_depth': signal.visible_depth,
+                }
+                iceberg_dicts.append(iceberg_dict)
+
+            # 收集信号（转换为 SignalEvent）
+            signals = manager.collect_signals(icebergs=iceberg_dicts)
+
+            if not signals:
+                return
+
+            # 执行 Phase 2 处理流程
+            result = manager.process_signals_v2(signals)
+
+            processed_signals = result['signals']
+            advice = result['advice']
+
+            # 发送 Bundle 告警
+            if self.discord_notifier and processed_signals:
+                advice_level = advice['advice']
+
+                # 根据建议级别决定是否发送
+                should_send = False
+                if advice_level in ['STRONG_BUY', 'STRONG_SELL']:
+                    should_send = True
+                elif advice_level in ['BUY', 'SELL']:
+                    # 中等建议，检查置信度
+                    should_send = advice['confidence'] > 0.6
+
+                if should_send:
+                    asyncio.create_task(
+                        self._send_phase2_bundle_alert(processed_signals, advice)
+                    )
+
+        except Exception as e:
+            console.print(f"[yellow]Phase 2 处理出错: {e}[/yellow]")
+
+    async def _send_phase2_bundle_alert(self, signals: List, advice: Dict):
+        """
+        发送 Phase 2 Bundle 告警到 Discord
+
+        Args:
+            signals: 处理后的 SignalEvent 列表
+            advice: 综合建议数据
+        """
+        try:
+            if hasattr(self.discord_notifier, 'send_bundle_alert'):
+                # 使用 Phase 2 的 Bundle 告警
+                await self.discord_notifier.send_bundle_alert(
+                    symbol=self.symbol,
+                    signals=signals,
+                    advice=advice,
+                    market_state={
+                        'current_price': self.current_price,
+                        'cvd_total': self.cvd_total,
+                        'whale_flow': self.total_whale_flow,
+                    }
+                )
+            else:
+                console.print("[yellow]Discord notifier 不支持 Bundle 告警[/yellow]")
+        except Exception as e:
+            console.print(f"[red]发送 Bundle 告警失败: {e}[/red]")
 
     # ========== 综合判断 ==========
 
@@ -1201,6 +1494,11 @@ class AlertMonitor:
             self.iceberg_buy_count + self.iceberg_sell_count,
             self.confirmed_buy_count + self.confirmed_sell_count
         )
+
+        # ========== K神战法 2.0 雷达更新 ==========
+        kgod_signal = None
+        if self.use_kgod and self.kgod_radar:
+            kgod_signal = self._update_kgod_radar(self.current_price, ind, event_ts)
 
         # 获取动态鲸鱼阈值
         if self.use_dynamic_threshold:
