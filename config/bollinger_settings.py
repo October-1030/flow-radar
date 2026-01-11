@@ -1,370 +1,296 @@
-#!/usr/bin/env python3
 """
-Bollinger Bands Regime Filter Configuration
-布林带环境过滤器配置
+布林带×订单流环境过滤器 - 配置参数
+Bollinger Regime Filter Configuration
 
+第三十四轮三方共识
 设计原则:
 - 所有阈值外部化，禁止硬编码
-- 配置分组清晰（布林带参数 / 走轨风险阈值 / 回归信号阈值 / 风控参数）
-- 提供默认值和推荐范围
+- 配置参数清晰命名，便于回测调优
+- 遵循 GPT + Gemini 三方共识的参数定义
 
-作者: Claude Code (三方共识)
-日期: 2026-01-09
-版本: v1.0
-参考: 第二十五轮三方共识
+作者: Claude Code
+日期: 2026-01-10
+版本: v2.0 (第三十四轮)
 """
 
-# ==================== 布林带参数 ====================
+# ==================== 布林带基础参数 ====================
 
-CONFIG_BOLLINGER_BANDS = {
-    # 基础参数
-    "period": 20,               # 周期（推荐范围: 10-30）
-    "std_dev": 2.0,             # 标准差倍数（推荐范围: 1.5-2.5）
+# 布林带计算参数（复用 RollingBB）
+BOLLINGER_PERIOD = 20  # 周期
+BOLLINGER_STD_DEV = 2.0  # 标准差倍数
 
-    # 扩展参数
-    "bandwidth_window": 100,    # 带宽历史窗口（用于检测挤压）
-    "squeeze_threshold": 0.5,   # 挤压阈值（当前带宽 < 平均值 * 0.5）
+
+# ==================== 环境状态识别参数 ====================
+
+# 带宽阈值（用于 SQUEEZE / EXPANSION 判定）
+BANDWIDTH_SQUEEZE_THRESHOLD = 0.015  # 1.5% - 带宽收口判定（低于此值为 SQUEEZE）
+BANDWIDTH_EXPANSION_THRESHOLD = 0.035  # 3.5% - 带宽扩张判定（高于此值为 EXPANSION）
+
+# 触轨判定缓冲区（状态平滑，防止抖动）
+TOUCH_BUFFER = 0.0002  # 0.02% - 价格在 [upper - buffer, upper] 视为 UPPER_TOUCH
+                        #         价格在 [lower, lower + buffer] 视为 LOWER_TOUCH
+
+# 走轨判定参数
+WALKBAND_MIN_ACCEPTANCE_TIME = 20.0  # 秒 - 最小带外停留时间才认定为 WALKING_BAND
+
+
+# ==================== acceptance_time 参数（核心机制）====================
+
+# acceptance_time 定义：价格在布林带外"连续"停留的累计秒数
+
+# 阈值
+ACCEPTANCE_TIME_WARNING = 30.0  # 秒 - 预警阈值（风险开始升高）
+ACCEPTANCE_TIME_BAN = 60.0  # 秒 - 封禁阈值（强走轨 BAN 的第一条件）
+
+# 重置条件
+RESET_GRACE_PERIOD = 3.0  # 秒 - 回到带内后需保持此时间才重置 acceptance_time
+                           # 防止短暂回调立即重置计时器
+
+# 强走轨 BAN 双条件（两个条件必须同时满足）
+# 条件 1: acceptance_time > ACCEPTANCE_TIME_BAN（60秒）
+# 条件 2: 动力确认（以下任一满足）：
+#   - Delta 加速（delta_slope > DELTA_SLOPE_THRESHOLD）
+#   - 扫单确认（sweep_score > SWEEP_SCORE_THRESHOLD）
+#   - 失衡持续（imbalance > IMBALANCE_THRESHOLD 持续 3 个周期）
+
+
+# ==================== 订单流共振参数 ====================
+
+# 失衡度阈值
+IMBALANCE_THRESHOLD = 0.6  # 买卖失衡度阈值（abs > 0.6 为显著失衡）
+IMBALANCE_STRONG_THRESHOLD = 0.75  # 强失衡阈值（用于高置信度场景）
+
+# 吸收量阈值
+ABSORPTION_SCORE_THRESHOLD = 2.5  # 吸收强度阈值（> 2.5 为显著吸收）
+
+# 扫单量阈值
+SWEEP_SCORE_THRESHOLD = 2.0  # 扫单强度阈值（> 2.0 为显著扫单）
+
+# 冰山检测阈值
+ICEBERG_INTENSITY_THRESHOLD = 2.0  # 冰山强度阈值（> 2.0 为显著冰山活动）
+
+# Delta 斜率阈值（用于动力确认）
+DELTA_SLOPE_THRESHOLD = 0.3  # Delta 加速度阈值（绝对值 > 0.3 为加速）
+
+
+# ==================== 共振场景置信度增强参数 ====================
+
+# 置信度提升系数（使用乘法增强）
+# 公式: new_confidence = min(100, base_confidence * (1 + boost))
+
+BOOST_ABSORPTION_REVERSAL = 0.15  # +15% - 吸收型回归（场景 1）
+BOOST_IMBALANCE_REVERSAL = 0.20  # +20% - 失衡确认回归（场景 2）
+BOOST_ICEBERG_DEFENSE = 0.25  # +25% - 冰山护盘回归（场景 3，最高）
+
+# 置信度上限
+MAX_CONFIDENCE = 100.0  # 最终置信度不超过 100
+
+
+# ==================== KGodRadar 集成参数 ====================
+
+# 增强阶段控制（仅在这些阶段应用置信度加成）
+BOOST_ALLOWED_STAGES = ["EARLY_CONFIRM", "KGOD_CONFIRM"]
+# PRE_ALERT 阶段不加分
+
+# 冲突处理优先级
+BAN_OVERRIDES_BOOST = True  # BAN 优先于 boost
+# 即：走轨风险高时，即使检测到共振，也忽略增强，优先 BAN
+
+
+# ==================== 状态平滑参数 ====================
+
+# 防止状态快速切换（抖动过滤）
+STATE_MIN_DURATION = 2.0  # 秒 - 状态至少持续此时间才生效
+
+
+# ==================== 场景定义（三方共识）====================
+
+# 场景 1: 吸收型回归（触轨 + 吸收强 + Delta 背离）
+SCENARIO_ABSORPTION_REVERSAL = {
+    "name": "吸收型回归",
+    "conditions": {
+        "touch_band": True,  # 触及布林带边界
+        "absorption_score": ABSORPTION_SCORE_THRESHOLD,  # 吸收强度 > 2.5
+        "delta_divergence": True,  # Delta 开始转负或衰减
+    },
+    "boost": BOOST_ABSORPTION_REVERSAL,  # +15%
+    "description": "价格触及边界但被吸收，Delta 背离，预期回归",
 }
 
-
-# ==================== 环境过滤器配置 ====================
-
-CONFIG_BOLLINGER_REGIME = {
-    # === 走轨风险阈值（BAN_REVERSION 判定）===
-
-    # Delta 相关
-    "delta_slope_threshold": 0.5,           # Delta 斜率阈值（单位: USDT/s）
-                                            # 推荐范围: 0.3-1.0
-                                            # 说明: Delta 加速超过此值 = 趋势加速
-
-    "delta_acceleration_threshold": 0.2,    # Delta 二阶导数阈值
-                                            # 推荐范围: 0.1-0.5
-                                            # 说明: 加速度指标，捕捉动量变化
-
-    # 失衡相关
-    "imbalance_threshold": 0.6,             # 失衡阈值（0-1）
-                                            # 推荐范围: 0.55-0.7
-                                            # 说明: buy_ratio 或 sell_ratio 超过此值
-
-    "persistent_imbalance_periods": 3,      # 持续失衡周期数
-                                            # 推荐范围: 2-5
-                                            # 说明: 连续 N 个周期保持失衡
-
-    # 扫单相关
-    "sweep_score_threshold": 0.7,           # 扫单得分阈值（0-1）
-                                            # 推荐范围: 0.6-0.8
-                                            # 说明: 激进扫单 = 突破意图
-
-    # 价格接受度
-    "acceptance_time_threshold": 30,        # 价格接受时间阈值（秒）
-                                            # 推荐范围: 15-60
-                                            # 说明: 价格在边界外持续时间
-
-    "acceptance_distance_threshold": 0.002, # 价格接受距离阈值（比例）
-                                            # 推荐范围: 0.001-0.005
-                                            # 说明: 价格超出边界的距离
-
-    # 带宽相关
-    "bandwidth_expansion_threshold": 0.008, # 带宽扩张阈值（比例）
-                                            # 推荐范围: 0.005-0.015
-                                            # 说明: 带宽超过此值 = 波动率扩张
-
-    "bandwidth_expansion_rate": 0.05,       # 带宽扩张速率阈值（5%）
-                                            # 推荐范围: 0.03-0.10
-                                            # 说明: 带宽变化率超过此值
-
-    # === 回归信号阈值（ALLOW_REVERSION 判定）===
-
-    # Delta 相关
-    "delta_divergence_threshold": -0.1,     # Delta 背离阈值
-                                            # 推荐范围: -0.2 ~ 0
-                                            # 说明: Delta 转负或衰减
-
-    "delta_reversal_ratio": 0.5,            # Delta 反转比例阈值
-                                            # 推荐范围: 0.3-0.7
-                                            # 说明: Delta 衰减到峰值的比例
-
-    # 吸收率相关
-    "absorption_threshold": 0.5,            # 吸收率阈值（0-1）
-                                            # 推荐范围: 0.4-0.7
-                                            # 说明: 买盘/卖盘被吸收的比例
-
-    "absorption_window": 5,                 # 吸收率计算窗口（周期数）
-                                            # 推荐范围: 3-10
-
-    # 深度相关
-    "depth_depletion_threshold": 0.3,       # 深度耗尽阈值（比例）
-                                            # 推荐范围: 0.2-0.5
-                                            # 说明: 盘口深度被消耗的比例
-
-    # === 冰山信号权重 ===
-
-    "iceberg_weight": {
-        "CRITICAL": 3.0,        # 冰山 CRITICAL 信号权重
-        "CONFIRMED": 2.0,       # 冰山 CONFIRMED 信号权重
-        "WARNING": 1.0,         # 冰山 WARNING 信号权重
-        "ACTIVITY": 0.5,        # 冰山 ACTIVITY 信号权重
-    },
-
-    # === 走轨风险评分权重 ===
-
-    "ban_reversion_weights": {
-        "bandwidth_expanding": 1.0,             # 带宽扩张权重
-        "delta_accelerating": 1.5,              # Delta 加速权重（GPT 强调）
-        "aggressive_sweeping": 1.2,             # 扫单权重
-        "persistent_imbalance": 1.0,            # 持续失衡权重
-        "price_accepted": 1.0,                  # 价格接受权重（GPT 独有）
-        "iceberg_opposite": 2.0,                # 反向冰山权重（最高）
-    },
-
-    "ban_reversion_threshold": 2.0,             # 走轨风险总分阈值
-                                                # 推荐范围: 1.5-3.0
-
-    # === 回归信号评分权重 ===
-
-    "allow_reversion_weights": {
-        "delta_divergence": 1.0,                # Delta 背离权重
-        "high_absorption": 1.0,                 # 高吸收率权重
-        "imbalance_reversal": 1.2,              # 失衡反转权重
-        "iceberg_defense": 2.0,                 # 冰山防守权重（Gemini +25%）
-        "depth_depletion": 0.8,                 # 深度耗尽权重
-    },
-
-    "allow_reversion_threshold": 2.0,           # 回归信号总分阈值
-                                                # 推荐范围: 1.5-3.0
-
-    # === 置信度提升（Gemini 量化）===
-
-    "confidence_boost": {
-        "delta_divergence": 0.10,               # Delta 背离 +10%
-        "high_absorption": 0.10,                # 高吸收率 +10%
-        "sell_imbalance": 0.15,                 # 卖方失衡 +15%
-        "buy_imbalance": 0.15,                  # 买方失衡 +15%
-        "iceberg_defense": 0.25,                # 冰山防守 +25%（最高）
-        "depth_depletion": 0.08,                # 深度耗尽 +8%
-        "squeeze_breakout": 0.12,               # 挤压突破 +12%
-    },
-
-    # === 风控参数 ===
-
-    "max_consecutive_losses": 3,                # 最大连续亏损次数
-                                                # 推荐范围: 2-5
-                                                # 说明: 达到此值后暂停回归交易
-
-    "cooldown_period": 300,                     # 冷却期（秒）
-                                                # 推荐范围: 180-600
-                                                # 说明: 连续亏损后的冷却时间
-
-    "min_confidence": 0.6,                      # 最低置信度阈值
-                                                # 推荐范围: 0.5-0.7
-                                                # 说明: 低于此值不发出信号
-
-    "max_holding_time": 3600,                   # 最大持仓时间（秒）
-                                                # 推荐范围: 1800-7200
-                                                # 说明: 超时未回归则止损
-
-    # === 调试和日志 ===
-
-    "enable_logging": True,                     # 是否启用日志
-    "log_level": "INFO",                        # 日志级别: DEBUG/INFO/WARNING
-    "log_all_evaluations": False,               # 是否记录所有评估（调试用）
-}
-
-
-# ==================== 场景配置（三方共识）====================
-
-# 场景 A: 衰竭性回归
-SCENARIO_A_EXHAUSTION_REVERSION = {
-    "name": "衰竭性回归",
-    "conditions": [
-        ("touch_upper_band", True),             # 触上轨
-        ("delta_divergence", True),             # Delta 背离
-        ("low_absorption", True),               # 吸收率低
-    ],
-    "output": "REVERSION_SHORT",
-    "confidence_boost": 0.15,
-    "source": "三方共识"
-}
-
-# 场景 B: 失衡确认回归
-SCENARIO_B_IMBALANCE_REVERSION = {
+# 场景 2: 失衡确认回归（触轨 + 失衡反转 + Delta 转负）
+SCENARIO_IMBALANCE_REVERSAL = {
     "name": "失衡确认回归",
-    "conditions": [
-        ("touch_upper_band", True),             # 触上轨
-        ("sell_imbalance", "> 0.6"),            # Sell Imbalance > 60%
-        ("delta_turn_negative", True),          # Delta 转负
-    ],
-    "output": "REVERSION_SHORT",
-    "confidence_boost": 0.20,
-    "source": "三方共识"
+    "conditions": {
+        "touch_band": True,  # 触及布林带边界
+        "imbalance_reversal": IMBALANCE_THRESHOLD,  # 失衡度 > 0.6 且反转
+        "delta_turn_negative": True,  # Delta 转负
+    },
+    "boost": BOOST_IMBALANCE_REVERSAL,  # +20%
+    "description": "触轨后失衡反转，Delta 转负，强回归信号",
 }
 
-# 场景 C: 冰山护盘回归
-SCENARIO_C_ICEBERG_DEFENSE = {
+# 场景 3: 冰山护盘回归（触轨 + 反向冰山单）
+SCENARIO_ICEBERG_DEFENSE = {
     "name": "冰山护盘回归",
-    "conditions": [
-        ("touch_upper_band", True),             # 触上轨
-        ("sell_iceberg_confirmed", True),       # 卖方冰山 CONFIRMED
-    ],
-    "output": "STRONG_REVERSION_SHORT",
-    "confidence_boost": 0.25,
-    "source": "三方共识 (Gemini 强调)"
+    "conditions": {
+        "touch_band": True,  # 触及布林带边界
+        "iceberg_opposite_direction": ICEBERG_INTENSITY_THRESHOLD,  # 反向冰山 > 2.0
+        "iceberg_level": ["CONFIRMED", "CRITICAL"],  # 至少 CONFIRMED 级别
+    },
+    "boost": BOOST_ICEBERG_DEFENSE,  # +25% (最高)
+    "description": "触上轨遇卖方冰山护盘，或触下轨遇买方冰山支撑",
 }
 
-# 场景 D: 挤压后触边界
-SCENARIO_D_SQUEEZE_BREAKOUT = {
-    "name": "挤压后触边界",
-    "conditions": [
-        ("bandwidth_squeeze", True),            # Bandwidth 收缩
-        ("touch_band", True),                   # 突然触轨
-        ("order_flow_check", "required"),       # 需要订单流判定
-    ],
-    "output": "DEPENDS_ON_FLOW",                # 视订单流而定
-    "confidence_boost": 0.12,
-    "source": "GPT 独有"
-}
-
-# 场景 E: 趋势性走轨
-SCENARIO_E_TREND_WALKING = {
-    "name": "趋势性走轨",
-    "conditions": [
-        ("touch_upper_band", True),             # 触上轨
-        ("delta_accelerating", True),           # Delta 加速
-        ("aggressive_sweeping", True),          # 扫单
-        ("depth_depleted", True),               # 深度抽干
-    ],
-    "output": "BAN_REVERSION",
-    "confidence_boost": 0.0,                    # 无增强，禁止操作
-    "source": "三方共识"
-}
-
-# 场景 F: 冰山反向突破
-SCENARIO_F_ICEBERG_BREAKOUT = {
-    "name": "冰山反向突破",
-    "conditions": [
-        ("touch_upper_band", True),             # 触上轨
-        ("buy_iceberg_confirmed", True),        # 买方冰山 CONFIRMED
-    ],
-    "output": "BAN_REVERSION",
-    "confidence_boost": 0.0,                    # 无增强，禁止操作
-    "source": "三方共识"
+# 场景 4: 走轨风险 BAN（acceptance_time > 60s + 动力确认）
+SCENARIO_WALKBAND_RISK = {
+    "name": "走轨风险 BAN",
+    "conditions": {
+        "acceptance_time": ACCEPTANCE_TIME_BAN,  # > 60秒
+        "momentum_confirmed": True,  # Delta 加速 或 扫单 或 失衡持续
+    },
+    "decision": "BAN",
+    "description": "价格在边界外停留过久且有动力确认，禁止回归交易",
 }
 
 
-# ==================== 场景注册表 ====================
+# ==================== 调试和日志参数 ====================
 
-SCENARIOS = {
-    "A": SCENARIO_A_EXHAUSTION_REVERSION,
-    "B": SCENARIO_B_IMBALANCE_REVERSION,
-    "C": SCENARIO_C_ICEBERG_DEFENSE,
-    "D": SCENARIO_D_SQUEEZE_BREAKOUT,
-    "E": SCENARIO_E_TREND_WALKING,
-    "F": SCENARIO_F_ICEBERG_BREAKOUT,
-}
+# 日志控制
+VERBOSE_LOGGING = False  # 默认关闭详细日志，回测时可开启
+LOG_LEVEL = "INFO"  # DEBUG / INFO / WARNING / ERROR
+
+# 日志详细度
+LOG_ALL_EVALUATIONS = False  # 是否记录所有评估（调试用）
+LOG_STATE_TRANSITIONS = True  # 是否记录状态切换
 
 
-# ==================== 验证函数 ====================
+# ==================== 参数验证 ====================
 
 def validate_config() -> bool:
-    """验证配置合法性"""
+    """验证配置参数合法性"""
     errors = []
 
-    # 检查布林带参数
-    if CONFIG_BOLLINGER_BANDS["period"] < 2:
-        errors.append("bb_period must be >= 2")
+    # 带宽阈值检查
+    if BANDWIDTH_SQUEEZE_THRESHOLD >= BANDWIDTH_EXPANSION_THRESHOLD:
+        errors.append("BANDWIDTH_SQUEEZE_THRESHOLD 必须小于 BANDWIDTH_EXPANSION_THRESHOLD")
 
-    if CONFIG_BOLLINGER_BANDS["std_dev"] <= 0:
-        errors.append("bb_std must be > 0")
+    # acceptance_time 阈值检查
+    if ACCEPTANCE_TIME_WARNING >= ACCEPTANCE_TIME_BAN:
+        errors.append("ACCEPTANCE_TIME_WARNING 必须小于 ACCEPTANCE_TIME_BAN")
 
-    # 检查阈值范围
-    regime = CONFIG_BOLLINGER_REGIME
+    if RESET_GRACE_PERIOD <= 0:
+        errors.append("RESET_GRACE_PERIOD 必须大于 0")
 
-    if not (0 < regime["imbalance_threshold"] < 1):
-        errors.append("imbalance_threshold must be in (0, 1)")
+    # 失衡阈值检查
+    if not (0 < IMBALANCE_THRESHOLD < 1):
+        errors.append("IMBALANCE_THRESHOLD 必须在 (0, 1) 范围内")
 
-    if not (0 < regime["absorption_threshold"] < 1):
-        errors.append("absorption_threshold must be in (0, 1)")
+    if not (0 < IMBALANCE_STRONG_THRESHOLD < 1):
+        errors.append("IMBALANCE_STRONG_THRESHOLD 必须在 (0, 1) 范围内")
 
-    if not (0 < regime["sweep_score_threshold"] < 1):
-        errors.append("sweep_score_threshold must be in (0, 1)")
+    if IMBALANCE_THRESHOLD >= IMBALANCE_STRONG_THRESHOLD:
+        errors.append("IMBALANCE_THRESHOLD 必须小于 IMBALANCE_STRONG_THRESHOLD")
 
-    if regime["max_consecutive_losses"] < 1:
-        errors.append("max_consecutive_losses must be >= 1")
+    # 置信度增强检查
+    if not (0 <= BOOST_ABSORPTION_REVERSAL <= 1):
+        errors.append("BOOST_ABSORPTION_REVERSAL 必须在 [0, 1] 范围内")
 
-    # 检查置信度提升
-    for key, value in regime["confidence_boost"].items():
-        if not (0 <= value <= 1):
-            errors.append(f"confidence_boost[{key}] must be in [0, 1], got {value}")
+    if not (0 <= BOOST_IMBALANCE_REVERSAL <= 1):
+        errors.append("BOOST_IMBALANCE_REVERSAL 必须在 [0, 1] 范围内")
+
+    if not (0 <= BOOST_ICEBERG_DEFENSE <= 1):
+        errors.append("BOOST_ICEBERG_DEFENSE 必须在 [0, 1] 范围内")
+
+    # 阈值正值检查
+    if ABSORPTION_SCORE_THRESHOLD <= 0:
+        errors.append("ABSORPTION_SCORE_THRESHOLD 必须大于 0")
+
+    if SWEEP_SCORE_THRESHOLD <= 0:
+        errors.append("SWEEP_SCORE_THRESHOLD 必须大于 0")
+
+    if ICEBERG_INTENSITY_THRESHOLD <= 0:
+        errors.append("ICEBERG_INTENSITY_THRESHOLD 必须大于 0")
+
+    if DELTA_SLOPE_THRESHOLD <= 0:
+        errors.append("DELTA_SLOPE_THRESHOLD 必须大于 0")
+
+    # 布林带参数检查
+    if BOLLINGER_PERIOD < 2:
+        errors.append("BOLLINGER_PERIOD 必须 >= 2")
+
+    if BOLLINGER_STD_DEV <= 0:
+        errors.append("BOLLINGER_STD_DEV 必须大于 0")
 
     if errors:
-        print("❌ 配置验证失败:")
-        for error in errors:
-            print(f"  - {error}")
-        return False
+        raise ValueError(f"配置参数验证失败:\n" + "\n".join(f"  - {e}" for e in errors))
 
-    print("✅ 配置验证通过")
     return True
 
 
-# ==================== 配置导出 ====================
-
-def get_config() -> dict:
-    """获取完整配置"""
-    return {
-        "bollinger_bands": CONFIG_BOLLINGER_BANDS,
-        "regime_filter": CONFIG_BOLLINGER_REGIME,
-        "scenarios": SCENARIOS,
-    }
-
+# ==================== 配置摘要输出 ====================
 
 def print_config_summary():
     """打印配置摘要"""
-    print("="*60)
-    print("Bollinger Regime Filter Configuration Summary")
-    print("="*60)
+    print("=" * 70)
+    print("布林带×订单流环境过滤器 - 配置摘要")
+    print("=" * 70)
 
     print("\n[布林带参数]")
-    for key, value in CONFIG_BOLLINGER_BANDS.items():
-        print(f"  {key:25s}: {value}")
+    print(f"  周期: {BOLLINGER_PERIOD}")
+    print(f"  标准差倍数: {BOLLINGER_STD_DEV}")
 
-    print("\n[走轨风险阈值]")
-    risk_keys = [
-        "delta_slope_threshold",
-        "imbalance_threshold",
-        "sweep_score_threshold",
-        "acceptance_time_threshold",
-        "bandwidth_expansion_threshold"
-    ]
-    for key in risk_keys:
-        print(f"  {key:35s}: {CONFIG_BOLLINGER_REGIME[key]}")
+    print("\n[环境状态阈值]")
+    print(f"  带宽收口阈值 (SQUEEZE): {BANDWIDTH_SQUEEZE_THRESHOLD:.3f}")
+    print(f"  带宽扩张阈值 (EXPANSION): {BANDWIDTH_EXPANSION_THRESHOLD:.3f}")
+    print(f"  触轨缓冲区 (TOUCH_BUFFER): {TOUCH_BUFFER:.4f}")
+    print(f"  走轨最小时间: {WALKBAND_MIN_ACCEPTANCE_TIME:.1f}s")
 
-    print("\n[回归信号阈值]")
-    reversion_keys = [
-        "delta_divergence_threshold",
-        "absorption_threshold",
-        "depth_depletion_threshold"
-    ]
-    for key in reversion_keys:
-        print(f"  {key:35s}: {CONFIG_BOLLINGER_REGIME[key]}")
+    print("\n[acceptance_time 参数]")
+    print(f"  预警阈值: {ACCEPTANCE_TIME_WARNING:.1f}s")
+    print(f"  封禁阈值: {ACCEPTANCE_TIME_BAN:.1f}s")
+    print(f"  重置宽限期: {RESET_GRACE_PERIOD:.1f}s")
 
-    print("\n[风控参数]")
-    risk_control_keys = [
-        "max_consecutive_losses",
-        "cooldown_period",
-        "min_confidence"
-    ]
-    for key in risk_control_keys:
-        print(f"  {key:35s}: {CONFIG_BOLLINGER_REGIME[key]}")
+    print("\n[订单流共振阈值]")
+    print(f"  失衡度: {IMBALANCE_THRESHOLD:.2f}")
+    print(f"  吸收强度: {ABSORPTION_SCORE_THRESHOLD:.2f}")
+    print(f"  扫单强度: {SWEEP_SCORE_THRESHOLD:.2f}")
+    print(f"  冰山强度: {ICEBERG_INTENSITY_THRESHOLD:.2f}")
+    print(f"  Delta 斜率: {DELTA_SLOPE_THRESHOLD:.2f}")
 
-    print("\n[置信度提升]")
-    for key, value in CONFIG_BOLLINGER_REGIME["confidence_boost"].items():
-        print(f"  {key:25s}: +{value*100:.0f}%")
+    print("\n[置信度增强（乘法）]")
+    print(f"  吸收型回归: +{BOOST_ABSORPTION_REVERSAL*100:.0f}%")
+    print(f"  失衡确认回归: +{BOOST_IMBALANCE_REVERSAL*100:.0f}%")
+    print(f"  冰山护盘回归: +{BOOST_ICEBERG_DEFENSE*100:.0f}%")
+
+    print("\n[KGodRadar 集成]")
+    print(f"  允许增强阶段: {', '.join(BOOST_ALLOWED_STAGES)}")
+    print(f"  BAN 优先于 boost: {BAN_OVERRIDES_BOOST}")
 
     print("\n[场景定义]")
-    for scenario_id, scenario in SCENARIOS.items():
-        print(f"  场景 {scenario_id}: {scenario['name']}")
-        print(f"    输出: {scenario['output']}")
-        print(f"    置信度: +{scenario['confidence_boost']*100:.0f}%")
+    for i, scenario in enumerate([
+        SCENARIO_ABSORPTION_REVERSAL,
+        SCENARIO_IMBALANCE_REVERSAL,
+        SCENARIO_ICEBERG_DEFENSE,
+        SCENARIO_WALKBAND_RISK,
+    ], 1):
+        print(f"  场景 {i}: {scenario['name']}")
+        if 'boost' in scenario:
+            print(f"    增强: +{scenario['boost']*100:.0f}%")
+        if 'decision' in scenario:
+            print(f"    决策: {scenario['decision']}")
+
+    print("\n" + "=" * 70)
+
+
+# ==================== 模块初始化验证 ====================
+
+# 导入时自动验证配置
+if __name__ != "__main__":
+    try:
+        validate_config()
+    except ValueError as e:
+        print(f"❌ {e}")
+        raise
 
 
 # ==================== 测试代码 ====================
@@ -372,4 +298,8 @@ def print_config_summary():
 if __name__ == "__main__":
     print_config_summary()
     print()
-    validate_config()
+    try:
+        validate_config()
+        print("✅ 配置验证通过")
+    except ValueError as e:
+        print(f"❌ {e}")

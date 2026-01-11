@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 > nul
 REM Flow Radar 72小时验证启动脚本
 REM 运行验收测试后启动监控
 
@@ -9,6 +10,9 @@ echo.
 
 REM 切换到项目目录
 cd /d %~dp0
+
+REM 设置 Python 编码
+set PYTHONIOENCODING=utf-8
 
 REM 运行验收测试
 echo [1/2] 运行验收测试...

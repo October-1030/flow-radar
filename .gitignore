@@ -42,6 +42,12 @@ storage/logs/*.log
 storage/signals/*.json
 storage/backtest/*.json
 
+# 运行时数据（不上传）
+storage/events/*.jsonl.gz
+storage/state/*.json
+storage/state/*.json.backup_*
+storage/runs/
+
 # 不忽略目录结构
 !storage/logs/.gitkeep
 !storage/signals/.gitkeep
@@ -51,3 +57,16 @@ storage/backtest/*.json
 .DS_Store
 Thumbs.db
 nul
+
+# 临时文件和测试输出
+*.log
+*.txt
+*-DESKTOP-*.gz
+*-DESKTOP-*.json
+test_*.py
+validate_*.py
+live_monitor_output.log
+同步验证结果.txt
+
+# Web 相关（如果是临时开发）
+web/

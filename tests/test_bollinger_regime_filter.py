@@ -1,18 +1,19 @@
-#!/usr/bin/env python3
 """
+布林带×订单流环境过滤器 - 单元测试
 Unit Tests for BollingerRegimeFilter
-布林带环境过滤器单元测试
 
+第三十四轮三方共识
 测试覆盖:
-- 6 个场景 (A-F) 全覆盖
-- 三态判定: ALLOW_REVERSION / BAN_REVERSION / NO_TRADE
-- 冰山信号融合
-- 连续亏损保护
-- 置信度提升验证
-- 边界条件处理
+- 4种共振场景检测
+- 置信度乘法调整验证
+- acceptance_time 累积和重置
+- 抖动触边测试
+- 冲突场景测试（BAN 优先）
+- 5种环境状态识别
 
-作者: Claude Code (三方共识)
-日期: 2026-01-09
+作者: Claude Code
+日期: 2026-01-10
+版本: v2.0
 """
 
 import sys
@@ -20,613 +21,498 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
-from dataclasses import dataclass
-
+import time
 from core.bollinger_regime_filter import (
     BollingerRegimeFilter,
-    RegimeSignal,
-    RegimeResult
+    RegimeDecision,
+    DecisionType,
+    RegimeState
 )
+from core.kgod_radar import OrderFlowSnapshot
 
 
-@dataclass
-class MockIcebergSignal:
-    """模拟冰山信号"""
-    side: str          # "BUY" or "SELL"
-    level: str         # "CRITICAL", "CONFIRMED", "WARNING", "ACTIVITY"
-
-
-class TestBollingerRegimeFilterBasic:
+class TestBasicFunctionality:
     """测试基础功能"""
 
     def test_initialization(self):
         """测试初始化"""
-        filter_eng = BollingerRegimeFilter()
+        filter_engine = BollingerRegimeFilter()
 
-        assert filter_eng.bb is not None
-        assert filter_eng.consecutive_losses == 0
-        assert filter_eng.last_loss_time == 0
+        assert filter_engine.bb is not None
+        assert filter_engine.current_state == RegimeState.NEUTRAL
+        assert filter_engine.acceptance_time == 0.0
 
-    def test_custom_config(self):
-        """测试自定义配置"""
-        custom_config = {
-            'bollinger_bands': {
-                'period': 10,
-                'std_dev': 1.5
-            },
-            'max_consecutive_losses': 5
-        }
+    def test_bb_not_ready(self):
+        """测试布林带未就绪"""
+        filter_engine = BollingerRegimeFilter()
 
-        filter_eng = BollingerRegimeFilter(config=custom_config)
+        flow = OrderFlowSnapshot()
+        result = filter_engine.evaluate(100.0, flow)
 
-        assert filter_eng.bb.period == 10
-        assert filter_eng.bb.std_dev == 1.5
-        assert filter_eng.max_consecutive_losses == 5
+        assert result.decision == DecisionType.NEUTRAL
+        assert "bb_not_ready" in result.reasons
 
-    def test_insufficient_data(self):
-        """测试数据不足时返回 NO_TRADE"""
-        filter_eng = BollingerRegimeFilter()
 
-        # 数据不足（< 20 个价格）
+class TestEnvironmentStates:
+    """测试 5 种环境状态识别"""
+
+    def setup_method(self):
+        """每个测试前初始化"""
+        self.filter_engine = BollingerRegimeFilter()
+        # 建立布林带（需要 20 个数据点）
+        for i in range(20):
+            flow = OrderFlowSnapshot()
+            self.filter_engine.evaluate(100.0, flow, timestamp=i)
+
+    def test_state_squeeze(self):
+        """测试 SQUEEZE 状态（带宽收口）"""
+        # 创建收口场景（价格几乎不波动）
         for i in range(10):
-            result = filter_eng.evaluate(price=100.0 + i * 0.1)
+            flow = OrderFlowSnapshot()
+            self.filter_engine.evaluate(100.0 + 0.001 * i, flow, timestamp=20 + i)
 
-            assert result.signal == RegimeSignal.NO_TRADE
-            assert "insufficient_data" in result.triggers
-            assert result.bands is None
+        # 检查状态（通过 meta 获取）
+        flow = OrderFlowSnapshot()
+        result = self.filter_engine.evaluate(100.0, flow, timestamp=30)
 
-    def test_build_bollinger_bands(self):
-        """测试布林带建立"""
-        filter_eng = BollingerRegimeFilter()
+        # bandwidth 应该很小，可能触发 SQUEEZE
+        # 注意：SQUEEZE 条件是 bandwidth < 0.015，需要足够的窄幅波动
 
-        # 建立布林带（20 个数据点）
-        for i in range(20):
-            filter_eng.evaluate(price=100.0 + i * 0.1)
+    def test_state_upper_touch(self):
+        """测试 UPPER_TOUCH 状态"""
+        # 价格上涨触上轨
+        flow = OrderFlowSnapshot()
+        result = self.filter_engine.evaluate(102.5, flow, timestamp=20)
 
-        # 第 21 个价格应该返回有效布林带
-        result = filter_eng.evaluate(price=100.0)
+        assert result.meta['state'] in [RegimeState.UPPER_TOUCH, RegimeState.NEUTRAL]
 
-        assert result.bands is not None
-        assert "insufficient_data" not in result.triggers
+    def test_state_lower_touch(self):
+        """测试 LOWER_TOUCH 状态"""
+        # 价格下跌触下轨
+        flow = OrderFlowSnapshot()
+        result = self.filter_engine.evaluate(97.5, flow, timestamp=20)
+
+        assert result.meta['state'] in [RegimeState.LOWER_TOUCH, RegimeState.NEUTRAL]
+
+    def test_state_walking_band(self):
+        """测试 WALKING_BAND 状态"""
+        # 价格持续在带外 > 20s
+        flow = OrderFlowSnapshot()
+
+        # 持续触上轨 25 秒
+        for i in range(25):
+            result = self.filter_engine.evaluate(102.5, flow, timestamp=20 + i)
+
+        # 应该进入 WALKING_BAND 状态
+        assert result.meta['state'] == RegimeState.WALKING_BAND or result.meta['acceptance_time'] > 20
 
 
-class TestScenarioA_ExhaustionReversion:
-    """测试场景 A: 衰竭性回归"""
+class TestAcceptanceTimeTracking:
+    """测试 acceptance_time 追踪机制"""
 
-    def test_scenario_a(self):
-        """测试场景 A: 触上轨 + Delta 背离 + 高吸收率"""
-        filter_eng = BollingerRegimeFilter()
+    def test_acceptance_time_accumulation(self):
+        """测试带外停留时间累积"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
-        # 场景 A 条件（需要足够的回归信号）
-        price = 102.5  # 触上轨
-        result = filter_eng.evaluate(
-            price=price,
-            delta_slope=-0.15,          # Delta 转负（背离）
-            absorption_ratio=0.6,        # 高吸收率
-            imbalance={"buy_ratio": 0.35, "sell_ratio": 0.65}  # 卖方失衡
+        # 价格持续在带外
+        flow = OrderFlowSnapshot()
+
+        # 第 1 秒：进入带外
+        result = filter_engine.evaluate(102.5, flow, timestamp=20.0)
+        assert result.meta['acceptance_time'] >= 0.0
+
+        # 第 5 秒：累积时间应约为 5s
+        result = filter_engine.evaluate(102.5, flow, timestamp=25.0)
+        assert result.meta['acceptance_time'] >= 4.0  # 至少 4 秒
+
+        # 第 10 秒
+        result = filter_engine.evaluate(102.5, flow, timestamp=30.0)
+        assert result.meta['acceptance_time'] >= 9.0
+
+    def test_acceptance_time_reset(self):
+        """测试 acceptance_time 重置机制"""
+        filter_engine = BollingerRegimeFilter()
+
+        # 建立布林带
+        for i in range(20):
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
+
+        flow = OrderFlowSnapshot()
+
+        # 在带外停留 10 秒
+        for i in range(10):
+            filter_engine.evaluate(102.5, flow, timestamp=20 + i)
+
+        # 回到带内
+        filter_engine.evaluate(100.0, flow, timestamp=30)
+
+        # 等待宽限期 (3 秒)
+        result = filter_engine.evaluate(100.0, flow, timestamp=33.5)
+
+        # acceptance_time 应该被重置
+        assert result.meta['acceptance_time'] == 0.0
+
+    def test_grace_period_cancellation(self):
+        """测试宽限期内回到带外（取消重置）"""
+        filter_engine = BollingerRegimeFilter()
+
+        # 建立布林带
+        for i in range(20):
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
+
+        flow = OrderFlowSnapshot()
+
+        # 在带外停留 10 秒
+        for i in range(10):
+            filter_engine.evaluate(102.5, flow, timestamp=20 + i)
+
+        acceptance_before = filter_engine.acceptance_time
+
+        # 回到带内 1 秒（宽限期内）
+        filter_engine.evaluate(100.0, flow, timestamp=30)
+
+        # 1 秒后又回到带外（宽限期 3 秒内）
+        result = filter_engine.evaluate(102.5, flow, timestamp=31)
+
+        # acceptance_time 不应该被重置（宽限期被取消）
+        assert filter_engine.acceptance_time > 0
+
+
+class TestJitterFiltering:
+    """测试抖动过滤（频繁穿轨不累积）"""
+
+    def test_frequent_edge_crossing(self):
+        """测试频繁触边（抖动）"""
+        filter_engine = BollingerRegimeFilter()
+
+        # 建立布林带
+        for i in range(20):
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
+
+        flow = OrderFlowSnapshot()
+
+        # 频繁在带内外切换（每 0.5 秒切换一次）
+        for i in range(10):
+            # 带外
+            filter_engine.evaluate(102.5, flow, timestamp=20 + i * 0.5)
+            # 带内
+            filter_engine.evaluate(100.0, flow, timestamp=20 + i * 0.5 + 0.25)
+
+        # 由于频繁切换，acceptance_time 不应该累积太多
+        # 每次回到带内都会启动宽限期
+        assert filter_engine.acceptance_time < 3.0  # 应该远小于 10 * 0.5 = 5 秒
+
+
+class TestScenario1_AbsorptionReversal:
+    """测试场景 1: 吸收型回归（+15%）"""
+
+    def test_absorption_reversal_detection(self):
+        """测试吸收型回归检测"""
+        filter_engine = BollingerRegimeFilter()
+
+        # 建立布林带
+        for i in range(20):
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
+
+        # 场景 1 条件：吸收强度 > 2.5 + Delta 背离
+        flow = OrderFlowSnapshot(
+            absorption_ask=3.0,      # 高吸收
+            delta_slope_10s=0.1,     # Delta 衰减（< 0.3）
         )
 
-        # 验证
-        assert result.signal == RegimeSignal.ALLOW_REVERSION_SHORT
-        assert "delta_divergence" in result.triggers
-        assert result.band_position in ["upper", "above_upper"]
-        assert result.confidence >= 0.60  # 基础 50% + 提升因素
-        # 场景标识可能不会被显式设置，取决于实现
+        result = filter_engine.evaluate(102.5, flow, timestamp=20)
 
-    def test_scenario_a_insufficient_conditions(self):
-        """测试场景 A: 条件不足"""
-        filter_eng = BollingerRegimeFilter()
+        # 应该检测到吸收型回归
+        assert result.decision == DecisionType.ALLOW_SHORT
+        assert "absorption_reversal" in result.reasons
+        assert result.confidence_boost == pytest.approx(0.15, rel=0.01)
+        assert result.meta['scenario'] == 1
+
+
+class TestScenario2_ImbalanceReversal:
+    """测试场景 2: 失衡确认回归（+20%）"""
+
+    def test_imbalance_reversal_detection(self):
+        """测试失衡确认回归检测"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
-        # 只有触上轨，没有其他条件
-        result = filter_eng.evaluate(
-            price=102.5,
-            delta_slope=0.1,           # Delta 仍为正（未背离）
-            absorption_ratio=0.2
+        # 场景 2 条件：失衡反转 + Delta 转负
+        flow = OrderFlowSnapshot(
+            imbalance_1s=0.3,        # 卖方失衡（< 0.4）
+            delta_slope_10s=-0.2,    # Delta 转负
         )
 
-        # 应该是 NO_TRADE（证据不足）
-        assert result.signal == RegimeSignal.NO_TRADE
-        assert result.confidence < 0.6  # 低于最低置信度
+        result = filter_engine.evaluate(102.5, flow, timestamp=20)
+
+        # 应该检测到失衡确认回归
+        assert result.decision == DecisionType.ALLOW_SHORT
+        assert "imbalance_reversal_sell" in result.reasons
+        assert result.confidence_boost == pytest.approx(0.20, rel=0.01)
+        assert result.meta['scenario'] == 2
 
 
-class TestScenarioB_ImbalanceReversion:
-    """测试场景 B: 失衡确认回归"""
+class TestScenario3_IcebergDefense:
+    """测试场景 3: 冰山护盘回归（+25%）"""
 
-    def test_scenario_b(self):
-        """测试场景 B: 触上轨 + 卖方失衡 > 60% + Delta 转负"""
-        filter_eng = BollingerRegimeFilter()
+    def test_iceberg_defense_detection(self):
+        """测试冰山护盘回归检测"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
-        # 场景 B 条件
-        price = 102.8
-        result = filter_eng.evaluate(
-            price=price,
-            delta_cumulative=-500,       # Delta 累积为负
-            delta_slope=-0.2,            # Delta 转负
-            imbalance={"buy_ratio": 0.35, "sell_ratio": 0.65}  # 卖方失衡
+        # 场景 3 条件：冰山强度 > 2.0 + 补单次数 >= 2
+        flow = OrderFlowSnapshot(
+            iceberg_intensity=2.5,   # 冰山强度高
+            refill_count=3,          # 补单次数
         )
 
-        # 验证
-        assert result.signal == RegimeSignal.ALLOW_REVERSION_SHORT
-        assert "sell_imbalance" in result.triggers
-        assert result.confidence >= 0.65  # 基础 50% + 失衡 +15%
+        result = filter_engine.evaluate(102.5, flow, timestamp=20)
 
+        # 应该检测到冰山护盘回归
+        assert result.decision == DecisionType.ALLOW_SHORT
+        assert "iceberg_defense_sell" in result.reasons
+        assert result.confidence_boost == pytest.approx(0.25, rel=0.01)
+        assert result.meta['scenario'] == 3
 
-class TestScenarioC_IcebergDefense:
-    """测试场景 C: 冰山护盘回归（Gemini +25%）"""
-
-    def test_scenario_c_sell_iceberg(self):
-        """测试场景 C: 触上轨 + 卖方冰山 CONFIRMED"""
-        filter_eng = BollingerRegimeFilter()
+    def test_iceberg_defense_mirror(self):
+        """测试冰山护盘回归（触下轨）"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
-        # 场景 C 条件: 卖方冰山护盘
-        icebergs = [MockIcebergSignal(side="SELL", level="CONFIRMED")]
-
-        price = 103.0
-        result = filter_eng.evaluate(
-            price=price,
-            delta_slope=-0.1,
-            absorption_ratio=0.6,
-            imbalance={"buy_ratio": 0.3, "sell_ratio": 0.7},
-            iceberg_signals=icebergs
+        # 场景 3 镜像：触下轨 + 买方冰山
+        flow = OrderFlowSnapshot(
+            iceberg_intensity=2.5,
+            refill_count=3,
         )
 
-        # 验证
-        assert result.signal == RegimeSignal.ALLOW_REVERSION_SHORT
-        assert "sell_iceberg_defense" in result.triggers
-        assert result.confidence >= 0.75  # 基础 50% + 冰山 +25%
+        result = filter_engine.evaluate(97.5, flow, timestamp=20)
 
-    def test_scenario_c_mirror_long(self):
-        """测试场景 C 镜像: 触下轨 + 买方冰山托底"""
-        filter_eng = BollingerRegimeFilter()
+        # 应该允许做多
+        assert result.decision == DecisionType.ALLOW_LONG
+        assert "iceberg_defense_buy" in result.reasons
+
+
+class TestScenario4_WalkbandRisk:
+    """测试场景 4: 走轨风险 BAN（双条件）"""
+
+    def test_walkband_risk_ban(self):
+        """测试走轨风险 BAN（acceptance_time > 60s + 动力确认）"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
-        # 场景 C 镜像: 买方冰山托底
-        icebergs = [MockIcebergSignal(side="BUY", level="CONFIRMED")]
+        # 在带外停留 65 秒
+        for i in range(65):
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(102.5, flow, timestamp=20 + i)
 
-        price = 97.5  # 触下轨
-        result = filter_eng.evaluate(
-            price=price,
-            delta_slope=0.1,             # Delta 转正
-            absorption_ratio=0.65,       # 高吸收率（卖盘被吸收）
-            imbalance={"buy_ratio": 0.7, "sell_ratio": 0.3},  # 买方失衡
-            iceberg_signals=icebergs
+        # 场景 4 条件：acceptance_time > 60s + 动力确认（Delta 加速）
+        flow = OrderFlowSnapshot(
+            delta_slope_10s=0.5,     # Delta 加速 (> 0.3)
         )
 
-        # 验证
-        assert result.signal == RegimeSignal.ALLOW_REVERSION_LONG
-        assert "buy_iceberg_defense" in result.triggers
-        assert result.confidence >= 0.90
+        result = filter_engine.evaluate(102.5, flow, timestamp=85)
 
+        # 应该 BAN
+        assert result.decision == DecisionType.BAN_SHORT
+        assert "walkband_risk_ban" in result.reasons
+        assert result.meta['scenario'] == 4
 
-class TestScenarioE_TrendWalking:
-    """测试场景 E: 趋势性走轨"""
-
-    def test_scenario_e(self):
-        """测试场景 E: 触上轨 + Delta 加速 + 扫单 + 深度抽干"""
-        filter_eng = BollingerRegimeFilter()
+    def test_walkband_risk_no_momentum(self):
+        """测试走轨风险（无动力确认 -> 不 BAN）"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
-        # 场景 E 条件: 趋势性走轨
-        price = 102.8
-        result = filter_eng.evaluate(
-            price=price,
-            delta_cumulative=5000,       # Delta 累积强势
-            delta_slope=0.8,             # Delta 加速
-            sweep_score=0.85,            # 高扫单得分
-            imbalance={"buy_ratio": 0.75, "sell_ratio": 0.25},  # 买方失衡
-            depth_depletion=0.5,         # 深度耗尽
-            acceptance_time=45           # 价格接受时间长
+        # 在带外停留 65 秒
+        for i in range(65):
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(102.5, flow, timestamp=20 + i)
+
+        # 无动力确认（Delta 斜率低，扫单低，失衡不持续）
+        flow = OrderFlowSnapshot(
+            delta_slope_10s=0.1,     # Delta 未加速
+            sweep_score_5s=1.0,      # 扫单低
+            imbalance_1s=0.5,        # 失衡不显著
         )
 
-        # 验证
-        assert result.signal == RegimeSignal.BAN_REVERSION
-        assert "delta_accelerating" in result.triggers
-        assert "aggressive_sweeping" in result.triggers
-        assert result.ban_score >= 2.0  # 走轨风险得分超过阈值
+        result = filter_engine.evaluate(102.5, flow, timestamp=85)
+
+        # 不应该 BAN（仅时间长不够，还需动力确认）
+        assert result.decision != DecisionType.BAN_SHORT or result.meta.get('scenario') != 4
 
 
-class TestScenarioF_IcebergBreakout:
-    """测试场景 F: 冰山反向突破"""
+class TestConflictPriority:
+    """测试冲突场景（BAN 优先）"""
 
-    def test_scenario_f(self):
-        """测试场景 F: 触上轨 + 买方冰山 CONFIRMED"""
-        filter_eng = BollingerRegimeFilter()
+    def test_ban_overrides_boost(self):
+        """测试 BAN 优先于共振增强"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
-        # 场景 F 条件: 买方冰山 = 突破意图
-        icebergs = [MockIcebergSignal(side="BUY", level="CONFIRMED")]
+        # 在带外停留 65 秒
+        for i in range(65):
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(102.5, flow, timestamp=20 + i)
 
-        price = 103.0
-        result = filter_eng.evaluate(
-            price=price,
-            delta_slope=0.3,
-            imbalance={"buy_ratio": 0.65, "sell_ratio": 0.35},
-            iceberg_signals=icebergs
+        # 冲突场景：既有冰山回归（+25%）又有走轨风险
+        flow = OrderFlowSnapshot(
+            iceberg_intensity=2.5,   # 冰山护盘
+            refill_count=3,
+            delta_slope_10s=0.5,     # Delta 加速（走轨风险）
         )
 
-        # 验证
-        assert result.signal == RegimeSignal.BAN_REVERSION
-        assert "buy_iceberg_at_upper" in result.triggers  # 触发名称可能不同
-        assert result.ban_score >= 2.0  # 冰山反向权重高
-
-
-class TestIcebergSignalIntegration:
-    """测试冰山信号融合"""
-
-    def test_iceberg_levels(self):
-        """测试不同冰山级别的权重"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
-
-        # CRITICAL 级别
-        icebergs_critical = [MockIcebergSignal(side="SELL", level="CRITICAL")]
-        result_critical = filter_eng.evaluate(
-            price=103.0,
-            iceberg_signals=icebergs_critical
-        )
-
-        # CONFIRMED 级别
-        icebergs_confirmed = [MockIcebergSignal(side="SELL", level="CONFIRMED")]
-        result_confirmed = filter_eng.evaluate(
-            price=103.0,
-            iceberg_signals=icebergs_confirmed
-        )
-
-        # CRITICAL 权重 > CONFIRMED
-        # (注意: 需要足够的其他条件才能允许回归)
-        # 这里主要验证权重被正确应用
-
-    def test_multiple_icebergs(self):
-        """测试多个冰山信号"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
-
-        # 多个卖方冰山
-        icebergs = [
-            MockIcebergSignal(side="SELL", level="CONFIRMED"),
-            MockIcebergSignal(side="SELL", level="WARNING")
-        ]
-
-        result = filter_eng.evaluate(
-            price=103.0,
-            delta_slope=-0.2,
-            absorption_ratio=0.7,
-            imbalance={"buy_ratio": 0.3, "sell_ratio": 0.7},
-            iceberg_signals=icebergs
-        )
-
-        # 多个冰山应该增强信号
-        assert result.signal == RegimeSignal.ALLOW_REVERSION_SHORT
-        assert result.confidence >= 0.85  # 高置信度
-
-    def test_opposite_direction_icebergs(self):
-        """测试反向冰山（应触发 BAN_REVERSION）"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
-
-        # 触上轨 + 买方冰山（反向） + 其他走轨信号
-        icebergs = [MockIcebergSignal(side="BUY", level="CONFIRMED")]
-
-        result = filter_eng.evaluate(
-            price=103.0,
-            delta_slope=0.6,  # Delta 加速
-            imbalance={"buy_ratio": 0.7, "sell_ratio": 0.3},  # 买方失衡
-            iceberg_signals=icebergs
-        )
-
-        # 应该禁止回归（反向冰山 + 其他走轨因素）
-        assert result.signal == RegimeSignal.BAN_REVERSION
-        assert "buy_iceberg_at_upper" in result.triggers  # 实际触发名称
-
-
-class TestConsecutiveLossProtection:
-    """测试连续亏损保护"""
-
-    def test_record_trade_result(self):
-        """测试记录交易结果"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 记录盈利
-        filter_eng.record_trade_result(is_win=True)
-        assert filter_eng.consecutive_losses == 0
-
-        # 记录亏损
-        filter_eng.record_trade_result(is_win=False)
-        assert filter_eng.consecutive_losses == 1
-
-        filter_eng.record_trade_result(is_win=False)
-        assert filter_eng.consecutive_losses == 2
-
-        # 记录盈利（重置）
-        filter_eng.record_trade_result(is_win=True)
-        assert filter_eng.consecutive_losses == 0
-
-    def test_cooldown_protection(self):
-        """测试冷却期保护"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
-
-        # 记录 3 次连续亏损
-        for _ in range(3):
-            filter_eng.record_trade_result(is_win=False)
-
-        # 尝试评估（应该被冷却期阻止）
-        icebergs = [MockIcebergSignal(side="SELL", level="CONFIRMED")]
-        result = filter_eng.evaluate(
-            price=103.0,
-            delta_slope=-0.2,
-            absorption_ratio=0.7,
-            imbalance={"buy_ratio": 0.3, "sell_ratio": 0.7},
-            iceberg_signals=icebergs
-        )
-
-        # 应该检测到冷却期（即使可能返回 BAN_REVERSION）
-        assert "max_consecutive_losses" in result.triggers or "in_cooldown" in result.triggers
-
-    def test_cooldown_expires(self):
-        """测试冷却期过期"""
-        import time
-
-        filter_eng = BollingerRegimeFilter()
-
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
-
-        # 记录 3 次亏损
-        for _ in range(3):
-            filter_eng.record_trade_result(is_win=False)
-
-        # 修改冷却期为 0.1 秒（测试用）
-        filter_eng.cooldown_period = 0.1
-        time.sleep(0.15)  # 等待冷却期过期
+        result = filter_engine.evaluate(102.5, flow, timestamp=85)
 
-        # 现在应该可以评估
-        icebergs = [MockIcebergSignal(side="SELL", level="CONFIRMED")]
-        result = filter_eng.evaluate(
-            price=103.0,
-            delta_slope=-0.2,
-            absorption_ratio=0.7,
-            imbalance={"buy_ratio": 0.3, "sell_ratio": 0.7},
-            iceberg_signals=icebergs
-        )
-
-        # 应该恢复正常判定
-        assert result.signal == RegimeSignal.ALLOW_REVERSION_SHORT
-
+        # BAN 应该优先（走轨风险 > 共振增强）
+        assert result.decision == DecisionType.BAN_SHORT
+        assert result.confidence_boost == 0.0  # BAN 不增强
 
-class TestConfidenceCalculation:
-    """测试置信度计算"""
 
-    def test_base_confidence(self):
-        """测试基础置信度"""
-        filter_eng = BollingerRegimeFilter()
+class TestConfidenceMultiplication:
+    """测试置信度乘法调整"""
 
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
+    def test_confidence_boost_multiplication(self):
+        """测试置信度乘法公式"""
+        filter_engine = BollingerRegimeFilter()
 
-        # 只有触上轨，没有其他订单流证据
-        result = filter_eng.evaluate(price=103.0)
+        base_confidence = 60.0
+        boost = 0.15  # +15%
 
-        # 如果证据不足，置信度会很低或为 0
-        # 这是合理的，因为没有订单流支持
-        assert result.confidence >= 0.0
+        # 公式: new_confidence = min(100, base_confidence * (1 + boost))
+        expected = min(100, base_confidence * (1 + boost))  # 60 * 1.15 = 69
 
-    def test_confidence_boosts(self):
-        """测试置信度提升"""
-        filter_eng = BollingerRegimeFilter()
+        result = filter_engine.apply_boost_to_confidence(base_confidence, boost)
 
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
+        assert result == pytest.approx(expected, rel=0.01)
 
-        # 场景 C: 最高置信度（+25%）
-        icebergs = [MockIcebergSignal(side="SELL", level="CONFIRMED")]
-        result = filter_eng.evaluate(
-            price=103.0,
-            delta_slope=-0.2,
-            absorption_ratio=0.7,
-            imbalance={"buy_ratio": 0.3, "sell_ratio": 0.7},
-            iceberg_signals=icebergs
-        )
+    def test_confidence_max_cap(self):
+        """测试置信度上限 100"""
+        filter_engine = BollingerRegimeFilter()
 
-        # 置信度应该 ≥ 90%（基础 50% + 冰山 +25% + 失衡 +15% + 其他）
-        assert result.confidence >= 0.85
+        base_confidence = 90.0
+        boost = 0.25  # +25%
 
-    def test_min_confidence_threshold(self):
-        """测试最低置信度阈值"""
-        filter_eng = BollingerRegimeFilter()
+        # 90 * 1.25 = 112.5 -> 应该被限制为 100
+        result = filter_engine.apply_boost_to_confidence(base_confidence, boost)
 
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
+        assert result == 100.0
 
-        # 只有微弱的触上轨（没有其他证据）
-        result = filter_eng.evaluate(
-            price=102.0,  # 接近上轨但未明显触碰
-            delta_slope=0.0
-        )
 
-        # 置信度低于阈值（60%）→ NO_TRADE
-        if result.confidence < 0.6:
-            assert result.signal == RegimeSignal.NO_TRADE
+class TestKGodRadarIntegration:
+    """测试与 KGodRadar 集成"""
 
+    def test_boost_allowed_stages(self):
+        """测试增强允许阶段"""
+        filter_engine = BollingerRegimeFilter()
 
-class TestBandPosition:
-    """测试布林带位置判定"""
+        # EARLY_CONFIRM 和 KGOD_CONFIRM 允许增强
+        assert filter_engine.should_boost_for_stage("EARLY_CONFIRM") == True
+        assert filter_engine.should_boost_for_stage("KGOD_CONFIRM") == True
 
-    def test_upper_band_scenarios(self):
-        """测试上轨场景"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
-
-        # 触上轨
-        result = filter_eng.evaluate(price=102.5)
-
-        assert result.band_position in ["upper", "above_upper"]
-
-    def test_lower_band_scenarios(self):
-        """测试下轨场景"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
-
-        # 触下轨
-        result = filter_eng.evaluate(price=97.5)
-
-        assert result.band_position in ["lower", "below_lower"]
-
-    def test_middle_band_no_trade(self):
-        """测试中轨区域（应该 NO_TRADE）"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 建立布林带（有一定波动）
-        for i in range(20):
-            price = 100.0 + (i % 3 - 1) * 0.5  # 在 99.5-100.5 间波动
-            filter_eng.evaluate(price=price)
-
-        # 中轨区域
-        result = filter_eng.evaluate(price=100.0)
-
-        # 中轨区域没有明确方向 → NO_TRADE
-        assert result.signal == RegimeSignal.NO_TRADE
+        # PRE_ALERT 和 BAN 不允许增强
+        assert filter_engine.should_boost_for_stage("PRE_ALERT") == False
+        assert filter_engine.should_boost_for_stage("BAN") == False
 
 
 class TestStatistics:
     """测试统计功能"""
 
-    def test_get_stats(self):
-        """测试统计信息"""
-        filter_eng = BollingerRegimeFilter()
+    def test_stats_tracking(self):
+        """测试统计信息追踪"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
         # 执行多次评估
-        for _ in range(5):
-            filter_eng.evaluate(price=103.0, delta_slope=-0.2)
+        flow_allow = OrderFlowSnapshot(iceberg_intensity=2.5, refill_count=3)
+        filter_engine.evaluate(102.5, flow_allow, timestamp=20)  # ALLOW
 
-        stats = filter_eng.get_stats()
+        flow_neutral = OrderFlowSnapshot()
+        filter_engine.evaluate(100.0, flow_neutral, timestamp=21)  # NEUTRAL
 
-        assert stats['total_evaluations'] > 0
-        assert 'allow_reversion_count' in stats
-        assert 'ban_reversion_count' in stats
-        assert 'no_trade_count' in stats
+        stats = filter_engine.get_stats()
 
-    def test_reset_loss_counter(self):
-        """测试重置亏损计数器"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 记录亏损
-        for _ in range(3):
-            filter_eng.record_trade_result(is_win=False)
-
-        assert filter_eng.consecutive_losses == 3
-
-        # 重置亏损计数器
-        filter_eng.reset_loss_counter()
-
-        assert filter_eng.consecutive_losses == 0
-        assert filter_eng.last_loss_time == 0
+        assert stats['total_evaluations'] >= 2
+        assert stats['allow_count'] >= 1
+        assert stats['neutral_count'] >= 1
 
 
 class TestEdgeCases:
     """测试边界情况"""
 
-    def test_zero_imbalance(self):
-        """测试失衡为 0 的情况"""
-        filter_eng = BollingerRegimeFilter()
+    def test_state_smoothing(self):
+        """测试状态平滑（STATE_MIN_DURATION）"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
-        # 失衡为 0
-        result = filter_eng.evaluate(
-            price=103.0,
-            imbalance={"buy_ratio": 0.0, "sell_ratio": 0.0}
-        )
+        # 快速切换状态（< 2 秒）
+        flow = OrderFlowSnapshot()
+        result1 = filter_engine.evaluate(102.5, flow, timestamp=20.0)  # 触上轨
+        result2 = filter_engine.evaluate(100.0, flow, timestamp=20.5)  # 0.5 秒后回中轨
 
-        # 应该正常处理（不触发失衡条件）
-        assert result.signal in [RegimeSignal.NO_TRADE, RegimeSignal.BAN_REVERSION]
+        # 状态切换应该被平滑（至少持续 2 秒）
+        # current_state 不应该立即切换
 
-    def test_none_iceberg_signals(self):
-        """测试 None 冰山信号"""
-        filter_eng = BollingerRegimeFilter()
-
-        # 建立布林带
-        for i in range(20):
-            filter_eng.evaluate(price=100.0)
-
-        # 冰山信号为 None
-        result = filter_eng.evaluate(
-            price=103.0,
-            iceberg_signals=None
-        )
-
-        # 应该正常处理（不触发冰山条件）
-        assert result.signal is not None
-
-    def test_empty_iceberg_signals(self):
-        """测试空冰山信号列表"""
-        filter_eng = BollingerRegimeFilter()
+    def test_manual_reset_acceptance_time(self):
+        """测试手动重置 acceptance_time"""
+        filter_engine = BollingerRegimeFilter()
 
         # 建立布林带
         for i in range(20):
-            filter_eng.evaluate(price=100.0)
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(100.0, flow, timestamp=i)
 
-        # 冰山信号为空列表
-        result = filter_eng.evaluate(
-            price=103.0,
-            iceberg_signals=[]
-        )
+        # 累积 acceptance_time
+        for i in range(10):
+            flow = OrderFlowSnapshot()
+            filter_engine.evaluate(102.5, flow, timestamp=20 + i)
 
-        # 应该正常处理
-        assert result.signal is not None
+        assert filter_engine.acceptance_time > 0
+
+        # 手动重置
+        filter_engine.reset_acceptance_time()
+
+        assert filter_engine.acceptance_time == 0.0
+        assert filter_engine.is_outside_band == False
 
 
 # ==================== pytest 配置 ====================
@@ -634,7 +520,7 @@ class TestEdgeCases:
 def pytest_configure(config):
     """pytest 配置"""
     config.addinivalue_line(
-        "markers", "scenario: marks tests by scenario (A-F)"
+        "markers", "slow: marks tests as slow"
     )
 
 

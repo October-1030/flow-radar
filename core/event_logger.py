@@ -107,6 +107,33 @@ class EventLogger:
         }
         self._write(event)
 
+    def log_iceberg(self, iceberg: Dict, timestamp: float = None):
+        """
+        P2-2: 记录冰山信号
+
+        Args:
+            iceberg: 冰山信号数据，包含:
+                - side: 'BUY' 或 'SELL'
+                - price: 价格
+                - cumulative_volume: 累计成交量
+                - visible_depth: 可见挂单量
+                - intensity: 强度
+                - refill_count: 补单次数
+                - confidence: 置信度
+                - level: 信号级别 (ACTIVITY/CONFIRMED)
+            timestamp: 时间戳
+        """
+        if timestamp is None:
+            timestamp = time.time()
+
+        event = {
+            "type": "iceberg",
+            "ts": timestamp,
+            "symbol": self.symbol,
+            "data": iceberg
+        }
+        self._write(event)
+
     def _write(self, event: Dict):
         """写入事件"""
         f = self._get_file()

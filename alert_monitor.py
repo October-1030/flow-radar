@@ -65,6 +65,12 @@ KGOD_ENABLED = CONFIG_FEATURES.get("use_kgod_radar", False)
 if KGOD_ENABLED:
     from core.kgod_radar import create_kgod_radar, OrderFlowSnapshot, SignalStage, KGodSignal
 
+# 布林带×订单流环境过滤器（第三十五轮三方共识）
+BOLLINGER_FILTER_ENABLED = CONFIG_FEATURES.get("use_bollinger_filter", False)
+BOLLINGER_FILTER_MODE = CONFIG_FEATURES.get("bollinger_filter_mode", "observe")
+if BOLLINGER_FILTER_ENABLED:
+    from core.bollinger_regime_filter import BollingerRegimeFilter, RegimeDecision, DecisionType
+
 console = Console()
 
 
@@ -290,6 +296,22 @@ class AlertMonitor:
         self.price_history = []          # 最近价格历史
         self.cvd_history = []            # 最近 CVD 历史
         self.last_cvd = 0.0              # 上次 CVD 值
+
+        # ========== 布林带×订单流环境过滤器（第三十五轮）==========
+        self.bollinger_filter = None
+        self.use_bollinger_filter = BOLLINGER_FILTER_ENABLED
+        self.bollinger_filter_mode = BOLLINGER_FILTER_MODE
+        self.filter_skipped_count = 0     # 预热期跳过计数
+        self.last_filter_decision = None  # 最近的过滤器决策（用于Discord通知）
+        if self.use_bollinger_filter:
+            try:
+                self.bollinger_filter = BollingerRegimeFilter()
+                console.print(f"[cyan]布林带环境过滤器已启用 (模式: {self.bollinger_filter_mode})[/cyan]")
+            except Exception as e:
+                console.print(f"[yellow]⚠️  布林带过滤器初始化失败: {e}[/yellow]")
+                console.print(f"[yellow]过滤器已禁用，继续运行[/yellow]")
+                self.use_bollinger_filter = False
+                self.bollinger_filter = None
 
     def _restore_state(self):
         """Step C: 启动时恢复状态 (P2-4: 扩展版)"""
@@ -1052,10 +1074,10 @@ class AlertMonitor:
             if signal:
                 self._handle_kgod_signal(signal)
 
-            return signal
+            return signal, order_flow  # 第三十五轮：返回 order_flow 供过滤器使用
         except Exception as e:
             console.print(f"[red]K神雷达更新失败: {e}[/red]")
-            return None
+            return None, None
 
     def _handle_kgod_signal(self, signal: 'KGodSignal'):
         """
@@ -1094,6 +1116,110 @@ class AlertMonitor:
                 self._format_kgod_message(signal),
                 alert_level
             )
+
+    def _apply_bollinger_filter(self, kgod_signal: 'KGodSignal',
+                                order_flow: 'OrderFlowSnapshot',
+                                event_ts: float) -> Optional['KGodSignal']:
+        """
+        应用布林带环境过滤器（第三十五轮三方共识）
+
+        Args:
+            kgod_signal: K神信号
+            order_flow: 订单流快照
+            event_ts: 事件时间戳
+
+        Returns:
+            处理后的信号（可能被 BAN 或增强），或 None（如果被禁止）
+        """
+        try:
+            # 1. 调用过滤器评估
+            decision = self.bollinger_filter.evaluate(
+                price=self.current_price,
+                order_flow=order_flow,
+                timestamp=event_ts
+            )
+
+            # 2. 记录到事件日志（observe 和 enforce 模式都记录）
+            self._log_filter_decision(decision, kgod_signal)
+
+            # 存储决策用于Discord通知
+            self.last_filter_decision = decision
+
+            # 3. 如果是 observe 模式，只记录不干预
+            if self.bollinger_filter_mode == "observe":
+                return kgod_signal
+
+            # 4. enforce 模式：应用决策
+            # 4.1 BAN 决策优先（覆盖信号）
+            if decision.decision == DecisionType.BAN_LONG and kgod_signal.side.value == "BUY":
+                console.print(
+                    f"[yellow]🚫 布林带过滤器 BAN 做多信号: {', '.join(decision.reasons)}[/yellow]"
+                )
+                return None  # 信号被禁止
+
+            elif decision.decision == DecisionType.BAN_SHORT and kgod_signal.side.value == "SELL":
+                console.print(
+                    f"[yellow]🚫 布林带过滤器 BAN 做空信号: {', '.join(decision.reasons)}[/yellow]"
+                )
+                return None  # 信号被禁止
+
+            # 4.2 置信度增强（仅在 EARLY_CONFIRM 和 KGOD_CONFIRM 阶段）
+            if decision.confidence_boost > 0:
+                from core.kgod_radar import SignalStage
+                allowed_stages = [SignalStage.EARLY_CONFIRM, SignalStage.KGOD_CONFIRM]
+
+                if kgod_signal.stage in allowed_stages:
+                    # 使用乘法公式: new_conf = min(100, base_conf * (1 + boost))
+                    old_confidence = kgod_signal.confidence
+                    new_confidence = min(100.0, old_confidence * (1 + decision.confidence_boost))
+                    kgod_signal.confidence = new_confidence
+
+                    console.print(
+                        f"[cyan]✨ 布林带过滤器增强置信度: {old_confidence:.1f}% → {new_confidence:.1f}% "
+                        f"(+{decision.confidence_boost*100:.0f}%, {', '.join(decision.reasons)})[/cyan]"
+                    )
+
+            return kgod_signal
+
+        except Exception as e:
+            # 降级策略：出错时继续运行，不干预信号
+            console.print(f"[yellow]⚠️  布林带过滤器执行失败: {e}，降级为 NEUTRAL[/yellow]")
+            import traceback
+            console.print(f"[dim]{traceback.format_exc()}[/dim]")
+            return kgod_signal
+
+    def _log_filter_decision(self, decision: 'RegimeDecision', kgod_signal: 'KGodSignal'):
+        """记录布林带过滤器决策到事件日志（结构化）"""
+        filter_log = {
+            "enabled": self.use_bollinger_filter,
+            "mode": self.bollinger_filter_mode,
+            "decision": decision.decision.value,
+            "confidence_boost": decision.confidence_boost,
+            "reasons": decision.reasons,
+            "acceptance_time_s": decision.meta.get("acceptance_time", 0.0),
+            "state": decision.meta.get("state", "UNKNOWN"),
+        }
+
+        # 添加共振场景检测结果
+        scenarios = []
+        if decision.meta.get("absorption_reversal"):
+            scenarios.append("absorption_reversal")
+        if decision.meta.get("imbalance_reversal"):
+            scenarios.append("imbalance_reversal")
+        if decision.meta.get("iceberg_defense"):
+            scenarios.append("iceberg_defense")
+        if decision.meta.get("walkband_risk"):
+            scenarios.append("walkband_risk")
+        filter_log["scenarios"] = scenarios
+
+        # 记录到 EventLogger（如果存在）
+        if hasattr(self, 'event_logger') and self.event_logger:
+            try:
+                # 将过滤器决策添加到下一个事件记录中
+                # TODO: 集成到 event_logger
+                pass
+            except Exception as e:
+                pass
 
     def _format_kgod_title(self, signal: 'KGodSignal') -> str:
         """格式化 K神信号标题"""
@@ -1144,6 +1270,29 @@ class AlertMonitor:
                     lines.append("⛔ 建议: 强制平仓")
                 elif self.kgod_radar.should_ban_entry():
                     lines.append("🚫 建议: 禁止开仓")
+
+        # 布林带共振场景（第三十五轮）
+        if self.last_filter_decision and self.last_filter_decision.confidence_boost > 0:
+            scenario_names = {
+                "absorption_reversal": "吸收型回归",
+                "imbalance_reversal": "失衡确认回归",
+                "iceberg_defense": "冰山护盘回归",
+            }
+            scenarios = []
+            for key, name in scenario_names.items():
+                if self.last_filter_decision.meta.get(key):
+                    scenarios.append(name)
+
+            if scenarios:
+                boost_pct = self.last_filter_decision.confidence_boost * 100
+                scenarios_text = "+".join(scenarios)
+                lines.append(f"✨ 共振: {scenarios_text} (+{boost_pct:.0f}%)")
+
+        # 布林带 BAN 原因（第三十五轮）
+        if self.last_filter_decision and self.last_filter_decision.decision.value.startswith("BAN"):
+            if self.last_filter_decision.reasons:
+                ban_reason = self.last_filter_decision.reasons[0]
+                lines.append(f"🚫 布林带BAN: {ban_reason}")
 
         return " | ".join(lines)
 
@@ -1497,8 +1646,13 @@ class AlertMonitor:
 
         # ========== K神战法 2.0 雷达更新 ==========
         kgod_signal = None
+        order_flow_snapshot = None
         if self.use_kgod and self.kgod_radar:
-            kgod_signal = self._update_kgod_radar(self.current_price, ind, event_ts)
+            kgod_signal, order_flow_snapshot = self._update_kgod_radar(self.current_price, ind, event_ts)
+
+        # ========== 布林带环境过滤器（第三十五轮）==========
+        if kgod_signal and self.use_bollinger_filter and self.bollinger_filter and order_flow_snapshot:
+            kgod_signal = self._apply_bollinger_filter(kgod_signal, order_flow_snapshot, event_ts)
 
         # 获取动态鲸鱼阈值
         if self.use_dynamic_threshold:

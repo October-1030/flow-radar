@@ -1,754 +1,740 @@
-#!/usr/bin/env python3
 """
-Bollinger Bands Regime Filter - 布林带环境过滤器
-流动性雷达 - 融合订单流的布林带判定系统
+布林带×订单流环境过滤器 - 核心逻辑
+Bollinger Regime Filter - Core Module
 
-核心功能:
-- 三态判定: ALLOW_REVERSION / BAN_REVERSION / NO_TRADE
-- 走轨风险检测（6个维度）
-- 回归信号识别（5个维度）
-- 冰山信号融合
-- 连续亏损保护
+第三十四轮三方共识
+功能:
+- 5种环境状态识别 (SQUEEZE, EXPANSION, UPPER_TOUCH, LOWER_TOUCH, WALKING_BAND)
+- 4种共振场景检测 (absorption_reversal, imbalance_reversal, iceberg_defense, walkband_risk)
+- acceptance_time 追踪机制
+- 置信度乘法调整
+- 与 KGodRadar 集成
 
-作者: Claude Code (三方共识)
-日期: 2026-01-09
-版本: v1.0
-参考: 第二十五轮三方共识
+作者: Claude Code
+日期: 2026-01-10
+版本: v2.0 (第三十四轮)
 """
 
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Optional, List, Dict
 import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Tuple
+from enum import Enum
 
-from core.bollinger_engine import IncrementalBollingerBands
-from config.bollinger_settings import CONFIG_BOLLINGER_REGIME, CONFIG_BOLLINGER_BANDS
+# 复用现有模块
+from core.kgod_radar import RollingBB, OrderFlowSnapshot
+
+# 导入配置
+from config import bollinger_settings as bsettings
 
 
 # ==================== 枚举定义 ====================
 
-class RegimeSignal(Enum):
-    """环境信号类型"""
-    ALLOW_REVERSION_SHORT = "allow_reversion_short"     # 允许做空回归
-    ALLOW_REVERSION_LONG = "allow_reversion_long"       # 允许做多回归
-    BAN_REVERSION = "ban_reversion"                     # 禁止回归（走轨风险）
-    NO_TRADE = "no_trade"                               # 无交易（证据不足）
+class RegimeState(Enum):
+    """布林带环境状态"""
+    SQUEEZE = "SQUEEZE"              # 收口
+    EXPANSION = "EXPANSION"          # 扩张
+    UPPER_TOUCH = "UPPER_TOUCH"      # 触上轨
+    LOWER_TOUCH = "LOWER_TOUCH"      # 触下轨
+    WALKING_BAND = "WALKING_BAND"    # 走轨
+    NEUTRAL = "NEUTRAL"              # 中性（带内）
+
+
+class DecisionType(Enum):
+    """判定结果类型"""
+    ALLOW_LONG = "ALLOW_LONG"        # 允许做多
+    ALLOW_SHORT = "ALLOW_SHORT"      # 允许做空
+    BAN_LONG = "BAN_LONG"            # 禁止做多
+    BAN_SHORT = "BAN_SHORT"          # 禁止做空
+    NEUTRAL = "NEUTRAL"              # 中性（无操作）
 
 
 # ==================== 数据结构 ====================
 
 @dataclass
-class RegimeResult:
-    """环境判定结果"""
-    signal: RegimeSignal                # 信号类型
-    confidence: float                   # 置信度 (0-1)
-    triggers: List[str] = field(default_factory=list)  # 触发因素列表
-    band_position: str = "middle"       # 价格位置: upper/lower/middle
-    timestamp: float = 0.0              # 时间戳
+class RegimeDecision:
+    """
+    环境判定结果（GPT 建议的接口）
 
-    # 详细评分（调试用）
-    ban_score: float = 0.0              # 走轨风险得分
-    reversion_score: float = 0.0        # 回归信号得分
+    字段说明:
+    - decision: 决策类型 (ALLOW_LONG / ALLOW_SHORT / BAN_LONG / BAN_SHORT / NEUTRAL)
+    - confidence_boost: 置信度增强系数 (0.15 = +15%)
+    - reasons: 触发原因列表
+    - meta: 元数据字典，包含:
+        - acceptance_time: 带外停留时间（秒）
+        - bandwidth: 当前带宽
+        - state: 环境状态 (RegimeState)
+        - scenario: 匹配的场景编号 (1-4)
+        - bands: 布林带数据 {upper, mid, lower, bandwidth, z}
+    """
+    decision: DecisionType
+    confidence_boost: float = 0.0  # 0.15 表示 +15%
+    reasons: List[str] = field(default_factory=list)
+    meta: Dict = field(default_factory=dict)
 
-    # 额外信息
-    bands: Optional[Dict] = None        # 布林带数据
-    scenario: Optional[str] = None      # 匹配的场景（A/B/C/D/E/F）
+    def to_dict(self) -> Dict:
+        """转换为字典格式"""
+        return {
+            'decision': self.decision.value,
+            'confidence_boost': self.confidence_boost,
+            'reasons': self.reasons,
+            'meta': self.meta
+        }
 
 
 # ==================== 核心过滤器 ====================
 
 class BollingerRegimeFilter:
     """
-    布林带环境过滤器 - 融合订单流判定
+    布林带×订单流环境过滤器
 
-    工作流程:
-    1. 更新布林带
-    2. 检测价格位置（触轨？）
-    3. 如果触轨:
-       a. 评估走轨风险（BAN_REVERSION）
-       b. 评估回归信号（ALLOW_REVERSION）
-    4. 输出判定结果
-
-    三方共识场景:
-    - 场景 A: 衰竭性回归 (+15%)
-    - 场景 B: 失衡确认回归 (+20%)
-    - 场景 C: 冰山护盘回归 (+25%)
-    - 场景 D: 挤压后触边界 (+12%)
-    - 场景 E: 趋势性走轨 (禁止)
-    - 场景 F: 冰山反向突破 (禁止)
+    核心功能:
+    1. 环境状态识别（5种状态）
+    2. 共振场景检测（4种场景）
+    3. acceptance_time 追踪
+    4. 置信度乘法调整
+    5. 与 KGodRadar 集成
     """
 
     def __init__(self, config: Optional[Dict] = None):
         """
-        初始化环境过滤器
+        初始化过滤器
 
         Args:
             config: 配置字典（可选，默认使用 bollinger_settings.py）
         """
-        # 使用默认配置或用户提供的配置
-        if config is None:
-            self.config = CONFIG_BOLLINGER_REGIME
-            bb_config = CONFIG_BOLLINGER_BANDS
-        else:
-            self.config = config
-            bb_config = config.get("bollinger_bands", {})
-
-        # 初始化布林带引擎
-        self.bb = IncrementalBollingerBands(
-            period=bb_config.get("period", 20),
-            std_dev=bb_config.get("std_dev", 2.0)
+        # 初始化布林带引擎（复用 RollingBB）
+        self.bb = RollingBB(
+            period=bsettings.BOLLINGER_PERIOD,
+            num_std=bsettings.BOLLINGER_STD_DEV
         )
-
-        # 提取阈值（避免重复查找）
-        self._extract_thresholds()
 
         # 状态追踪
-        self.consecutive_losses = 0
-        self.last_loss_time = 0
-        self.last_touch_time = {"upper": 0, "lower": 0}
-        self.last_band_position = "middle"
+        self.current_state = RegimeState.NEUTRAL
+        self.state_enter_time = 0.0  # 状态进入时间
 
-        # 带宽历史（用于挤压检测）
-        from collections import deque
-        self.bandwidth_history = deque(
-            maxlen=bb_config.get("bandwidth_window", 100)
-        )
+        # acceptance_time 追踪机制
+        self.acceptance_time = 0.0  # 带外停留累计时间（秒）
+        self.last_update_ts = 0.0  # 上次更新时间戳
+        self.is_outside_band = False  # 是否在带外
+        self.outside_band_start_ts = 0.0  # 开始带外的时间戳
+        self.grace_period_start = 0.0  # 宽限期开始时间
+
+        # 失衡历史（用于检测持续失衡）
+        self.imbalance_history = deque(maxlen=5)
 
         # 统计信息
         self.stats = {
-            "total_evaluations": 0,
-            "allow_reversion_count": 0,
-            "ban_reversion_count": 0,
-            "no_trade_count": 0,
+            'total_evaluations': 0,
+            'allow_count': 0,
+            'ban_count': 0,
+            'neutral_count': 0,
         }
-
-    def _extract_thresholds(self):
-        """提取配置阈值（性能优化）"""
-        cfg = self.config
-
-        # 走轨风险阈值
-        self.delta_slope_threshold = cfg.get("delta_slope_threshold", 0.5)
-        self.imbalance_threshold = cfg.get("imbalance_threshold", 0.6)
-        self.sweep_score_threshold = cfg.get("sweep_score_threshold", 0.7)
-        self.acceptance_time_threshold = cfg.get("acceptance_time_threshold", 30)
-        self.bandwidth_expansion_threshold = cfg.get("bandwidth_expansion_threshold", 0.008)
-
-        # 回归信号阈值
-        self.delta_divergence_threshold = cfg.get("delta_divergence_threshold", -0.1)
-        self.absorption_threshold = cfg.get("absorption_threshold", 0.5)
-        self.depth_depletion_threshold = cfg.get("depth_depletion_threshold", 0.3)
-
-        # 风控参数
-        self.max_consecutive_losses = cfg.get("max_consecutive_losses", 3)
-        self.cooldown_period = cfg.get("cooldown_period", 300)
-        self.min_confidence = cfg.get("min_confidence", 0.6)
-
-        # 权重
-        self.ban_weights = cfg.get("ban_reversion_weights", {})
-        self.ban_threshold = cfg.get("ban_reversion_threshold", 2.0)
-
-        self.reversion_weights = cfg.get("allow_reversion_weights", {})
-        self.reversion_threshold = cfg.get("allow_reversion_threshold", 2.0)
-
-        # 置信度提升
-        self.confidence_boost = cfg.get("confidence_boost", {})
-
-        # 冰山权重
-        self.iceberg_weight = cfg.get("iceberg_weight", {})
 
     def evaluate(
         self,
         price: float,
-        delta_cumulative: float = 0.0,
-        delta_slope: float = 0.0,
-        absorption_ratio: float = 0.0,
-        imbalance: Optional[Dict] = None,
-        sweep_score: float = 0.0,
-        iceberg_signals: Optional[List] = None,
-        acceptance_time: float = 0.0,
-        depth_depletion: float = 0.0
-    ) -> RegimeResult:
+        order_flow: OrderFlowSnapshot,
+        timestamp: Optional[float] = None
+    ) -> RegimeDecision:
         """
-        核心评估：价格触边界时综合判定
+        核心评估方法
 
         Args:
             price: 当前价格
-            delta_cumulative: 累积 Delta (USDT)
-            delta_slope: Delta 斜率 (USDT/s)
-            absorption_ratio: 吸收率 (0-1)
-            imbalance: 失衡字典 {"buy_ratio": 0.7, "sell_ratio": 0.3}
-            sweep_score: 扫单得分 (0-1)
-            iceberg_signals: 冰山信号列表
-            acceptance_time: 价格在边界外持续时间（秒）
-            depth_depletion: 深度耗尽比例 (0-1)
+            order_flow: 订单流快照（OrderFlowSnapshot）
+            timestamp: 时间戳（可选，默认使用 time.time()）
 
         Returns:
-            RegimeResult: 判定结果
+            RegimeDecision: 环境判定结果
         """
-        self.stats["total_evaluations"] += 1
+        self.stats['total_evaluations'] += 1
 
-        # 默认值
-        if imbalance is None:
-            imbalance = {"buy_ratio": 0.5, "sell_ratio": 0.5}
-
-        if iceberg_signals is None:
-            iceberg_signals = []
+        if timestamp is None:
+            timestamp = time.time()
 
         # 更新布林带
-        bands = self.bb.update(price)
+        self.bb.update(price)
 
-        # 数据不足
-        if bands is None:
-            return RegimeResult(
-                signal=RegimeSignal.NO_TRADE,
-                confidence=0.0,
-                triggers=["insufficient_data"],
-                band_position="unknown",
-                timestamp=time.time()
+        # 检查布林带是否就绪
+        if not self.bb.is_ready():
+            return RegimeDecision(
+                decision=DecisionType.NEUTRAL,
+                confidence_boost=0.0,
+                reasons=["bb_not_ready"],
+                meta={'state': RegimeState.NEUTRAL}
             )
 
-        # 更新带宽历史
-        self.bandwidth_history.append(bands["bandwidth"])
+        # 获取布林带数据
+        bands = {
+            'upper': self.bb.upper,
+            'mid': self.bb.mid,
+            'lower': self.bb.lower,
+            'bandwidth': self.bb.bandwidth,
+            'z': self.bb.z
+        }
 
-        # 连续亏损保护（Gemini 建议）
-        if self.consecutive_losses >= self.max_consecutive_losses:
-            # 检查冷却期
-            if time.time() - self.last_loss_time < self.cooldown_period:
-                self.stats["no_trade_count"] += 1
-                return RegimeResult(
-                    signal=RegimeSignal.BAN_REVERSION,
-                    confidence=0.9,
-                    triggers=["max_consecutive_losses", "in_cooldown"],
-                    band_position="middle",
-                    timestamp=time.time(),
-                    bands=bands
-                )
+        # 1. 识别环境状态
+        state = self._detect_state(price, bands, timestamp)
 
-        # 检测价格位置
-        band_position = self._get_band_position(price, bands)
-        self.last_band_position = band_position
+        # 2. 更新 acceptance_time
+        self._update_acceptance_time(state, timestamp)
 
-        # === 触上轨逻辑 ===
-        if band_position in ["upper", "above_upper"]:
-            self.last_touch_time["upper"] = time.time()
-            result = self._evaluate_upper(
-                price, bands, delta_cumulative, delta_slope,
-                absorption_ratio, imbalance, sweep_score,
-                iceberg_signals, acceptance_time, depth_depletion
-            )
-            result.bands = bands
-            return result
+        # 3. 构建 meta 数据
+        meta = {
+            'acceptance_time': self.acceptance_time,
+            'bandwidth': bands['bandwidth'],
+            'state': state,
+            'bands': bands,
+            'timestamp': timestamp
+        }
 
-        # === 触下轨逻辑（镜像）===
-        elif band_position in ["lower", "below_lower"]:
-            self.last_touch_time["lower"] = time.time()
-            result = self._evaluate_lower(
-                price, bands, delta_cumulative, delta_slope,
-                absorption_ratio, imbalance, sweep_score,
-                iceberg_signals, acceptance_time, depth_depletion
-            )
-            result.bands = bands
-            return result
+        # 4. 根据状态执行相应检测
+        if state == RegimeState.UPPER_TOUCH:
+            return self._handle_upper_touch(price, bands, order_flow, meta)
 
-        # 价格在中间区域
-        self.stats["no_trade_count"] += 1
-        return RegimeResult(
-            signal=RegimeSignal.NO_TRADE,
-            confidence=0.0,
-            triggers=[],
-            band_position=band_position,
-            timestamp=time.time(),
-            bands=bands
-        )
+        elif state == RegimeState.LOWER_TOUCH:
+            return self._handle_lower_touch(price, bands, order_flow, meta)
 
-    def _evaluate_upper(
-        self, price, bands, delta_cum, delta_slope,
-        absorption, imbalance, sweep_score, icebergs,
-        acceptance_time, depth_depletion
-    ) -> RegimeResult:
-        """触上轨时的判定逻辑"""
-        triggers = []
-        ban_score = 0.0
-        reversion_score = 0.0
-        base_confidence = 0.5
-        scenario = None
+        elif state == RegimeState.WALKING_BAND:
+            # 走轨状态直接 BAN
+            decision = self._determine_ban_direction(price, bands)
+            self.stats['ban_count'] += 1
 
-        # ===  走轨风险检测（BAN_REVERSION）===
-
-        # 1. 带宽扩张
-        if bands["bandwidth"] > self.bandwidth_expansion_threshold:
-            weight = self.ban_weights.get("bandwidth_expanding", 1.0)
-            ban_score += weight
-            triggers.append("bandwidth_expanding")
-
-        # 2. Delta 加速（GPT 强调）
-        if delta_slope > self.delta_slope_threshold:
-            weight = self.ban_weights.get("delta_accelerating", 1.5)
-            ban_score += weight
-            triggers.append("delta_accelerating")
-
-        # 3. 扫单得分高
-        if sweep_score > self.sweep_score_threshold:
-            weight = self.ban_weights.get("aggressive_sweeping", 1.2)
-            ban_score += weight
-            triggers.append("aggressive_sweeping")
-
-        # 4. 持续买方失衡
-        buy_ratio = imbalance.get("buy_ratio", 0.5)
-        if buy_ratio > self.imbalance_threshold:
-            weight = self.ban_weights.get("persistent_imbalance", 1.0)
-            ban_score += weight
-            triggers.append("persistent_buy_imbalance")
-
-        # 5. 价格接受时间过长（GPT 独有）
-        if acceptance_time > self.acceptance_time_threshold:
-            weight = self.ban_weights.get("price_accepted", 1.0)
-            ban_score += weight
-            triggers.append("price_accepted_above_band")
-
-        # 6. 买方冰山 = 突破风险（场景 F）
-        buy_iceberg = self._check_iceberg_side(icebergs, "BUY", min_level="CONFIRMED")
-        if buy_iceberg:
-            weight = self.ban_weights.get("iceberg_opposite", 2.0)
-            ban_score += weight
-            triggers.append("buy_iceberg_at_upper")
-            scenario = "F"  # 场景 F: 冰山反向突破
-
-        # 走轨判定（场景 E）
-        if ban_score >= self.ban_threshold:
-            if scenario is None:
-                scenario = "E"  # 场景 E: 趋势性走轨
-
-            self.stats["ban_reversion_count"] += 1
-            return RegimeResult(
-                signal=RegimeSignal.BAN_REVERSION,
-                confidence=0.8,
-                triggers=triggers,
-                band_position="upper",
-                timestamp=time.time(),
-                ban_score=ban_score,
-                scenario=scenario
+            return RegimeDecision(
+                decision=decision,
+                confidence_boost=0.0,  # BAN 不增强
+                reasons=["walking_band_detected"],
+                meta={**meta, 'scenario': 4}
             )
 
-        # === 回归信号检测（ALLOW_REVERSION）===
-        triggers_reversion = []
-
-        # 1. Delta 背离/衰减（场景 A）
-        if delta_slope < self.delta_divergence_threshold or delta_cum < 0:
-            weight = self.reversion_weights.get("delta_divergence", 1.0)
-            reversion_score += weight
-            boost = self.confidence_boost.get("delta_divergence", 0.10)
-            base_confidence += boost
-            triggers_reversion.append("delta_divergence")
-
-        # 2. 吸收率高（买盘被吸收）（场景 A）
-        if absorption > self.absorption_threshold:
-            weight = self.reversion_weights.get("high_absorption", 1.0)
-            reversion_score += weight
-            boost = self.confidence_boost.get("high_absorption", 0.10)
-            base_confidence += boost
-            triggers_reversion.append("high_absorption")
-
-        # 3. 卖方失衡（场景 B）
-        sell_ratio = imbalance.get("sell_ratio", 0.5)
-        if sell_ratio > self.imbalance_threshold:
-            weight = self.reversion_weights.get("imbalance_reversal", 1.2)
-            reversion_score += weight
-            boost = self.confidence_boost.get("sell_imbalance", 0.15)
-            base_confidence += boost
-            triggers_reversion.append("sell_imbalance")
-            if scenario is None:
-                scenario = "B"  # 场景 B: 失衡确认回归
-
-        # 4. 卖方冰山护盘（场景 C，Gemini +25%）
-        sell_iceberg = self._check_iceberg_side(icebergs, "SELL", min_level="CONFIRMED")
-        if sell_iceberg:
-            weight = self.reversion_weights.get("iceberg_defense", 2.0)
-            reversion_score += weight
-            boost = self.confidence_boost.get("iceberg_defense", 0.25)
-            base_confidence += boost
-            triggers_reversion.append("sell_iceberg_defense")
-            scenario = "C"  # 场景 C: 冰山护盘回归
-
-        # 5. 深度耗尽
-        if depth_depletion > self.depth_depletion_threshold:
-            weight = self.reversion_weights.get("depth_depletion", 0.8)
-            reversion_score += weight
-            boost = self.confidence_boost.get("depth_depletion", 0.08)
-            base_confidence += boost
-            triggers_reversion.append("depth_depletion")
-
-        # 回归判定
-        if reversion_score >= self.reversion_threshold:
-            # 确定场景
-            if scenario is None:
-                if len(triggers_reversion) >= 2:
-                    scenario = "A"  # 场景 A: 衰竭性回归
-
-            # 置信度限制
-            final_confidence = min(base_confidence, 0.95)
-
-            # 最低置信度检查
-            if final_confidence < self.min_confidence:
-                self.stats["no_trade_count"] += 1
-                return RegimeResult(
-                    signal=RegimeSignal.NO_TRADE,
-                    confidence=final_confidence,
-                    triggers=triggers_reversion + ["confidence_too_low"],
-                    band_position="upper",
-                    timestamp=time.time(),
-                    reversion_score=reversion_score
-                )
-
-            self.stats["allow_reversion_count"] += 1
-            return RegimeResult(
-                signal=RegimeSignal.ALLOW_REVERSION_SHORT,
-                confidence=final_confidence,
-                triggers=triggers_reversion,
-                band_position="upper",
-                timestamp=time.time(),
-                reversion_score=reversion_score,
-                scenario=scenario
-            )
-
-        # 证据不足
-        self.stats["no_trade_count"] += 1
-        return RegimeResult(
-            signal=RegimeSignal.NO_TRADE,
-            confidence=0.0,
-            triggers=[],
-            band_position="upper",
-            timestamp=time.time(),
-            ban_score=ban_score,
-            reversion_score=reversion_score
-        )
-
-    def _evaluate_lower(
-        self, price, bands, delta_cum, delta_slope,
-        absorption, imbalance, sweep_score, icebergs,
-        acceptance_time, depth_depletion
-    ) -> RegimeResult:
-        """触下轨时的判定逻辑（镜像）"""
-        triggers = []
-        ban_score = 0.0
-        reversion_score = 0.0
-        base_confidence = 0.5
-        scenario = None
-
-        # === 走轨风险检测（BAN_REVERSION）===
-
-        # 1. 带宽扩张
-        if bands["bandwidth"] > self.bandwidth_expansion_threshold:
-            weight = self.ban_weights.get("bandwidth_expanding", 1.0)
-            ban_score += weight
-            triggers.append("bandwidth_expanding")
-
-        # 2. Delta 加速（负方向）
-        if delta_slope < -self.delta_slope_threshold:
-            weight = self.ban_weights.get("delta_accelerating", 1.5)
-            ban_score += weight
-            triggers.append("delta_decelerating")
-
-        # 3. 扫单得分高
-        if sweep_score > self.sweep_score_threshold:
-            weight = self.ban_weights.get("aggressive_sweeping", 1.2)
-            ban_score += weight
-            triggers.append("aggressive_sweeping")
-
-        # 4. 持续卖方失衡
-        sell_ratio = imbalance.get("sell_ratio", 0.5)
-        if sell_ratio > self.imbalance_threshold:
-            weight = self.ban_weights.get("persistent_imbalance", 1.0)
-            ban_score += weight
-            triggers.append("persistent_sell_imbalance")
-
-        # 5. 价格接受时间过长
-        if acceptance_time > self.acceptance_time_threshold:
-            weight = self.ban_weights.get("price_accepted", 1.0)
-            ban_score += weight
-            triggers.append("price_accepted_below_band")
-
-        # 6. 卖方冰山 = 突破风险（镜像场景 F）
-        sell_iceberg = self._check_iceberg_side(icebergs, "SELL", min_level="CONFIRMED")
-        if sell_iceberg:
-            weight = self.ban_weights.get("iceberg_opposite", 2.0)
-            ban_score += weight
-            triggers.append("sell_iceberg_at_lower")
-            scenario = "F_mirror"
-
-        # 走轨判定
-        if ban_score >= self.ban_threshold:
-            if scenario is None:
-                scenario = "E_mirror"
-
-            self.stats["ban_reversion_count"] += 1
-            return RegimeResult(
-                signal=RegimeSignal.BAN_REVERSION,
-                confidence=0.8,
-                triggers=triggers,
-                band_position="lower",
-                timestamp=time.time(),
-                ban_score=ban_score,
-                scenario=scenario
-            )
-
-        # === 回归信号检测（ALLOW_REVERSION）===
-        triggers_reversion = []
-
-        # 1. Delta 背离/转正
-        if delta_slope > -self.delta_divergence_threshold or delta_cum > 0:
-            weight = self.reversion_weights.get("delta_divergence", 1.0)
-            reversion_score += weight
-            boost = self.confidence_boost.get("delta_divergence", 0.10)
-            base_confidence += boost
-            triggers_reversion.append("delta_divergence")
-
-        # 2. 吸收率高（卖盘被吸收）
-        if absorption > self.absorption_threshold:
-            weight = self.reversion_weights.get("high_absorption", 1.0)
-            reversion_score += weight
-            boost = self.confidence_boost.get("high_absorption", 0.10)
-            base_confidence += boost
-            triggers_reversion.append("high_absorption")
-
-        # 3. 买方失衡（镜像场景 B）
-        buy_ratio = imbalance.get("buy_ratio", 0.5)
-        if buy_ratio > self.imbalance_threshold:
-            weight = self.reversion_weights.get("imbalance_reversal", 1.2)
-            reversion_score += weight
-            boost = self.confidence_boost.get("buy_imbalance", 0.15)
-            base_confidence += boost
-            triggers_reversion.append("buy_imbalance")
-            if scenario is None:
-                scenario = "B_mirror"
-
-        # 4. 买方冰山托底（镜像场景 C）
-        buy_iceberg = self._check_iceberg_side(icebergs, "BUY", min_level="CONFIRMED")
-        if buy_iceberg:
-            weight = self.reversion_weights.get("iceberg_defense", 2.0)
-            reversion_score += weight
-            boost = self.confidence_boost.get("iceberg_defense", 0.25)
-            base_confidence += boost
-            triggers_reversion.append("buy_iceberg_defense")
-            scenario = "C_mirror"
-
-        # 5. 深度耗尽
-        if depth_depletion > self.depth_depletion_threshold:
-            weight = self.reversion_weights.get("depth_depletion", 0.8)
-            reversion_score += weight
-            boost = self.confidence_boost.get("depth_depletion", 0.08)
-            base_confidence += boost
-            triggers_reversion.append("depth_depletion")
-
-        # 回归判定
-        if reversion_score >= self.reversion_threshold:
-            if scenario is None:
-                scenario = "A_mirror"
-
-            final_confidence = min(base_confidence, 0.95)
-
-            if final_confidence < self.min_confidence:
-                self.stats["no_trade_count"] += 1
-                return RegimeResult(
-                    signal=RegimeSignal.NO_TRADE,
-                    confidence=final_confidence,
-                    triggers=triggers_reversion + ["confidence_too_low"],
-                    band_position="lower",
-                    timestamp=time.time(),
-                    reversion_score=reversion_score
-                )
-
-            self.stats["allow_reversion_count"] += 1
-            return RegimeResult(
-                signal=RegimeSignal.ALLOW_REVERSION_LONG,
-                confidence=final_confidence,
-                triggers=triggers_reversion,
-                band_position="lower",
-                timestamp=time.time(),
-                reversion_score=reversion_score,
-                scenario=scenario
-            )
-
-        # 证据不足
-        self.stats["no_trade_count"] += 1
-        return RegimeResult(
-            signal=RegimeSignal.NO_TRADE,
-            confidence=0.0,
-            triggers=[],
-            band_position="lower",
-            timestamp=time.time(),
-            ban_score=ban_score,
-            reversion_score=reversion_score
-        )
-
-    def _get_band_position(self, price: float, bands: Dict) -> str:
-        """获取价格在布林带中的位置"""
-        upper = bands["upper"]
-        middle = bands["middle"]
-        lower = bands["lower"]
-
-        # 距离阈值（0.05%）
-        threshold = middle * 0.0005
-
-        if price > upper + threshold:
-            return "above_upper"
-        elif abs(price - upper) <= threshold:
-            return "upper"
-        elif price > middle + threshold:
-            return "upper_half"
-        elif abs(price - middle) <= threshold:
-            return "middle"
-        elif price > lower + threshold:
-            return "lower_half"
-        elif abs(price - lower) <= threshold:
-            return "lower"
         else:
-            return "below_lower"
+            # NEUTRAL, SQUEEZE, EXPANSION 状态 -> 无操作
+            self.stats['neutral_count'] += 1
 
-    def _check_iceberg_side(self, icebergs: List, side: str, min_level: str = "CONFIRMED") -> bool:
+            return RegimeDecision(
+                decision=DecisionType.NEUTRAL,
+                confidence_boost=0.0,
+                reasons=[],
+                meta=meta
+            )
+
+    def _detect_state(self, price: float, bands: Dict, timestamp: float) -> RegimeState:
         """
-        检查是否有指定方向的冰山信号
+        检测当前环境状态（5种状态）
 
-        Args:
-            icebergs: 冰山信号列表
-            side: "BUY" 或 "SELL"
-            min_level: 最低级别（默认 CONFIRMED）
+        状态优先级:
+        1. WALKING_BAND（最高优先级）
+        2. UPPER_TOUCH / LOWER_TOUCH
+        3. EXPANSION / SQUEEZE
+        4. NEUTRAL（默认）
+        """
+        # 提取布林带数据
+        upper = bands['upper']
+        lower = bands['lower']
+        bandwidth = bands['bandwidth']
+
+        # 状态 1: SQUEEZE（收口）
+        if bandwidth < bsettings.BANDWIDTH_SQUEEZE_THRESHOLD:
+            return self._set_state(RegimeState.SQUEEZE, timestamp)
+
+        # 状态 2: EXPANSION（扩张）
+        if bandwidth > bsettings.BANDWIDTH_EXPANSION_THRESHOLD:
+            return self._set_state(RegimeState.EXPANSION, timestamp)
+
+        # 状态 3: UPPER_TOUCH（触上轨，含缓冲区）
+        touch_buffer = bsettings.TOUCH_BUFFER
+        if upper - touch_buffer <= price <= upper + touch_buffer:
+            return self._set_state(RegimeState.UPPER_TOUCH, timestamp)
+
+        # 状态 4: LOWER_TOUCH（触下轨，含缓冲区）
+        if lower - touch_buffer <= price <= lower + touch_buffer:
+            return self._set_state(RegimeState.LOWER_TOUCH, timestamp)
+
+        # 状态 5: WALKING_BAND（走轨）
+        # 条件: acceptance_time > 20s 且价格仍在带外
+        if self.acceptance_time > bsettings.WALKBAND_MIN_ACCEPTANCE_TIME:
+            if price > upper or price < lower:
+                return self._set_state(RegimeState.WALKING_BAND, timestamp)
+
+        # 默认: NEUTRAL（带内）
+        return self._set_state(RegimeState.NEUTRAL, timestamp)
+
+    def _set_state(self, new_state: RegimeState, timestamp: float) -> RegimeState:
+        """
+        设置状态（含状态平滑处理）
+
+        状态切换至少持续 STATE_MIN_DURATION 秒才生效
+        """
+        # 如果状态未改变，直接返回
+        if new_state == self.current_state:
+            return self.current_state
+
+        # 计算状态持续时间
+        duration = timestamp - self.state_enter_time
+
+        # 状态平滑：至少持续 2 秒才切换
+        if duration < bsettings.STATE_MIN_DURATION:
+            return self.current_state  # 保持原状态
+
+        # 切换到新状态
+        self.current_state = new_state
+        self.state_enter_time = timestamp
+
+        return new_state
+
+    def _update_acceptance_time(self, state: RegimeState, timestamp: float):
+        """
+        更新 acceptance_time（带外停留累计时间）
+
+        核心逻辑:
+        1. 如果在带外（UPPER_TOUCH, LOWER_TOUCH, WALKING_BAND）-> 累积时间
+        2. 如果回到带内 -> 启动宽限期，持续 reset_grace 秒后重置
+        3. 如果在宽限期内又回到带外 -> 取消重置，继续累积
+        """
+        # 初始化时间戳
+        if self.last_update_ts == 0:
+            self.last_update_ts = timestamp
+            return
+
+        # 计算时间差
+        dt = timestamp - self.last_update_ts
+        self.last_update_ts = timestamp
+
+        # 判断是否在带外
+        is_outside = state in [
+            RegimeState.UPPER_TOUCH,
+            RegimeState.LOWER_TOUCH,
+            RegimeState.WALKING_BAND
+        ]
+
+        if is_outside:
+            # 在带外 -> 累积时间
+            if not self.is_outside_band:
+                # 刚进入带外
+                self.is_outside_band = True
+                self.outside_band_start_ts = timestamp
+                self.grace_period_start = 0.0  # 取消宽限期
+
+            # 累积 acceptance_time
+            self.acceptance_time += dt
+
+        else:
+            # 在带内
+            if self.is_outside_band:
+                # 刚回到带内 -> 启动宽限期
+                self.is_outside_band = False
+                self.grace_period_start = timestamp
+
+            # 检查宽限期
+            if self.grace_period_start > 0:
+                grace_duration = timestamp - self.grace_period_start
+
+                # 超过宽限期 -> 重置 acceptance_time
+                if grace_duration > bsettings.RESET_GRACE_PERIOD:
+                    self.acceptance_time = 0.0
+                    self.grace_period_start = 0.0
+
+    def _handle_upper_touch(
+        self,
+        price: float,
+        bands: Dict,
+        order_flow: OrderFlowSnapshot,
+        meta: Dict
+    ) -> RegimeDecision:
+        """
+        处理触上轨场景
+
+        检测顺序（优先级）:
+        1. check_walkband_risk() -> BAN
+        2. check_iceberg_defense() -> ALLOW_SHORT (+25%)
+        3. check_imbalance_reversal() -> ALLOW_SHORT (+20%)
+        4. check_absorption_reversal() -> ALLOW_SHORT (+15%)
+        5. 无匹配 -> NEUTRAL
+        """
+        # 场景 4: 走轨风险 BAN（最高优先级）
+        if self.check_walkband_risk(order_flow):
+            self.stats['ban_count'] += 1
+            return RegimeDecision(
+                decision=DecisionType.BAN_SHORT,
+                confidence_boost=0.0,
+                reasons=["walkband_risk_ban"],
+                meta={**meta, 'scenario': 4}
+            )
+
+        # 场景 3: 冰山护盘回归（+25%）
+        if self.check_iceberg_defense(order_flow, expected_side="SELL"):
+            self.stats['allow_count'] += 1
+            return RegimeDecision(
+                decision=DecisionType.ALLOW_SHORT,
+                confidence_boost=bsettings.BOOST_ICEBERG_DEFENSE,
+                reasons=["iceberg_defense_sell"],
+                meta={**meta, 'scenario': 3}
+            )
+
+        # 场景 2: 失衡确认回归（+20%）
+        if self.check_imbalance_reversal(order_flow, expected_side="SELL"):
+            self.stats['allow_count'] += 1
+            return RegimeDecision(
+                decision=DecisionType.ALLOW_SHORT,
+                confidence_boost=bsettings.BOOST_IMBALANCE_REVERSAL,
+                reasons=["imbalance_reversal_sell"],
+                meta={**meta, 'scenario': 2}
+            )
+
+        # 场景 1: 吸收型回归（+15%）
+        if self.check_absorption_reversal(order_flow):
+            self.stats['allow_count'] += 1
+            return RegimeDecision(
+                decision=DecisionType.ALLOW_SHORT,
+                confidence_boost=bsettings.BOOST_ABSORPTION_REVERSAL,
+                reasons=["absorption_reversal"],
+                meta={**meta, 'scenario': 1}
+            )
+
+        # 无匹配场景
+        self.stats['neutral_count'] += 1
+        return RegimeDecision(
+            decision=DecisionType.NEUTRAL,
+            confidence_boost=0.0,
+            reasons=["no_scenario_matched"],
+            meta=meta
+        )
+
+    def _handle_lower_touch(
+        self,
+        price: float,
+        bands: Dict,
+        order_flow: OrderFlowSnapshot,
+        meta: Dict
+    ) -> RegimeDecision:
+        """
+        处理触下轨场景（镜像逻辑）
+
+        检测顺序（优先级）:
+        1. check_walkband_risk() -> BAN
+        2. check_iceberg_defense() -> ALLOW_LONG (+25%)
+        3. check_imbalance_reversal() -> ALLOW_LONG (+20%)
+        4. check_absorption_reversal() -> ALLOW_LONG (+15%)
+        5. 无匹配 -> NEUTRAL
+        """
+        # 场景 4: 走轨风险 BAN
+        if self.check_walkband_risk(order_flow):
+            self.stats['ban_count'] += 1
+            return RegimeDecision(
+                decision=DecisionType.BAN_LONG,
+                confidence_boost=0.0,
+                reasons=["walkband_risk_ban"],
+                meta={**meta, 'scenario': 4}
+            )
+
+        # 场景 3: 冰山护盘回归（+25%）
+        if self.check_iceberg_defense(order_flow, expected_side="BUY"):
+            self.stats['allow_count'] += 1
+            return RegimeDecision(
+                decision=DecisionType.ALLOW_LONG,
+                confidence_boost=bsettings.BOOST_ICEBERG_DEFENSE,
+                reasons=["iceberg_defense_buy"],
+                meta={**meta, 'scenario': 3}
+            )
+
+        # 场景 2: 失衡确认回归（+20%）
+        if self.check_imbalance_reversal(order_flow, expected_side="BUY"):
+            self.stats['allow_count'] += 1
+            return RegimeDecision(
+                decision=DecisionType.ALLOW_LONG,
+                confidence_boost=bsettings.BOOST_IMBALANCE_REVERSAL,
+                reasons=["imbalance_reversal_buy"],
+                meta={**meta, 'scenario': 2}
+            )
+
+        # 场景 1: 吸收型回归（+15%）
+        if self.check_absorption_reversal(order_flow):
+            self.stats['allow_count'] += 1
+            return RegimeDecision(
+                decision=DecisionType.ALLOW_LONG,
+                confidence_boost=bsettings.BOOST_ABSORPTION_REVERSAL,
+                reasons=["absorption_reversal"],
+                meta={**meta, 'scenario': 1}
+            )
+
+        # 无匹配场景
+        self.stats['neutral_count'] += 1
+        return RegimeDecision(
+            decision=DecisionType.NEUTRAL,
+            confidence_boost=0.0,
+            reasons=["no_scenario_matched"],
+            meta=meta
+        )
+
+    # ==================== 4种共振场景检测方法 ====================
+
+    def check_absorption_reversal(self, order_flow: OrderFlowSnapshot) -> bool:
+        """
+        场景 1: 吸收型回归（触轨 + 吸收强 + Delta 背离）
+
+        条件:
+        - absorption_ask > 2.5 或 absorption_bid > 2.5
+        - delta_slope_10s 转负（或绝对值 < 阈值）
 
         Returns:
-            True 如果存在符合条件的冰山信号
+            True 如果检测到吸收型回归
         """
-        level_priority = {"CRITICAL": 1, "CONFIRMED": 2, "WARNING": 3, "ACTIVITY": 4}
-        min_priority = level_priority.get(min_level, 2)
+        # 条件 1: 吸收强度高
+        absorption_strong = (
+            order_flow.absorption_ask > bsettings.ABSORPTION_SCORE_THRESHOLD or
+            order_flow.absorption_bid > bsettings.ABSORPTION_SCORE_THRESHOLD
+        )
 
-        for signal in icebergs:
-            # 检查方向
-            if hasattr(signal, 'side') and signal.side == side:
-                # 检查级别
-                if hasattr(signal, 'level'):
-                    signal_priority = level_priority.get(signal.level, 999)
-                    if signal_priority <= min_priority:
-                        return True
+        # 条件 2: Delta 背离（斜率转负或接近0）
+        delta_divergence = abs(order_flow.delta_slope_10s) < bsettings.DELTA_SLOPE_THRESHOLD
 
-        return False
+        return absorption_strong and delta_divergence
 
-    def record_trade_result(self, is_win: bool):
+    def check_imbalance_reversal(
+        self,
+        order_flow: OrderFlowSnapshot,
+        expected_side: str
+    ) -> bool:
         """
-        记录交易结果（Gemini 建议）
+        场景 2: 失衡确认回归（触轨 + 失衡反转 + Delta 转负）
 
         Args:
-            is_win: 是否盈利
-        """
-        if is_win:
-            self.consecutive_losses = 0
-        else:
-            self.consecutive_losses += 1
-            self.last_loss_time = time.time()
+            expected_side: 预期方向 ("BUY" 或 "SELL")
 
-    def reset_loss_counter(self):
-        """手动重置亏损计数器"""
-        self.consecutive_losses = 0
-        self.last_loss_time = 0
+        条件:
+        - 触上轨时: 卖方失衡 > 0.6 且 Delta 转负
+        - 触下轨时: 买方失衡 > 0.6 且 Delta 转正
+
+        Returns:
+            True 如果检测到失衡确认回归
+        """
+        imbalance = order_flow.imbalance_1s
+
+        # 记录失衡历史
+        self.imbalance_history.append(imbalance)
+
+        if expected_side == "SELL":
+            # 触上轨 -> 检测卖方失衡
+            # 失衡反转：imbalance < 0.4（卖方占比 > 60%）
+            imbalance_condition = imbalance < (1 - bsettings.IMBALANCE_THRESHOLD)
+
+            # Delta 转负
+            delta_condition = order_flow.delta_slope_10s < 0
+
+        elif expected_side == "BUY":
+            # 触下轨 -> 检测买方失衡
+            # 失衡反转：imbalance > 0.6（买方占比 > 60%）
+            imbalance_condition = imbalance > bsettings.IMBALANCE_THRESHOLD
+
+            # Delta 转正
+            delta_condition = order_flow.delta_slope_10s > 0
+
+        else:
+            return False
+
+        return imbalance_condition and delta_condition
+
+    def check_iceberg_defense(
+        self,
+        order_flow: OrderFlowSnapshot,
+        expected_side: str
+    ) -> bool:
+        """
+        场景 3: 冰山护盘回归（触轨 + 反向冰山单）
+
+        Args:
+            expected_side: 预期方向 ("BUY" 或 "SELL")
+
+        条件:
+        - 触上轨时: 检测到卖方冰山（iceberg_intensity > 2.0）
+        - 触下轨时: 检测到买方冰山（iceberg_intensity > 2.0）
+
+        Returns:
+            True 如果检测到冰山护盘回归
+        """
+        # 检测冰山强度
+        iceberg_detected = order_flow.iceberg_intensity > bsettings.ICEBERG_INTENSITY_THRESHOLD
+
+        # 检测补单次数（额外确认）
+        refill_confirmed = order_flow.refill_count >= 2
+
+        return iceberg_detected and refill_confirmed
+
+    def check_walkband_risk(self, order_flow: OrderFlowSnapshot) -> bool:
+        """
+        场景 4: 走轨风险 BAN（acceptance_time > 60s + 动力确认）
+
+        强走轨 BAN 双条件（GPT 建议）:
+        - 条件 1: acceptance_time > 60s
+        - 条件 2: 动力确认（以下任一满足）:
+            * Delta 加速（abs(delta_slope) > 0.3）
+            * 扫单确认（sweep_score > 2.0）
+            * 失衡持续（连续 3 个周期 imbalance > 0.6）
+
+        Returns:
+            True 如果检测到走轨风险
+        """
+        # 条件 1: acceptance_time 超过阈值
+        if self.acceptance_time <= bsettings.ACCEPTANCE_TIME_BAN:
+            return False
+
+        # 条件 2: 动力确认（3选1）
+
+        # 动力 1: Delta 加速
+        delta_accelerating = abs(order_flow.delta_slope_10s) > bsettings.DELTA_SLOPE_THRESHOLD
+
+        # 动力 2: 扫单确认
+        sweep_confirmed = order_flow.sweep_score_5s > bsettings.SWEEP_SCORE_THRESHOLD
+
+        # 动力 3: 失衡持续（检查历史）
+        if len(self.imbalance_history) >= 3:
+            recent_imbalances = list(self.imbalance_history)[-3:]
+            # 检测持续失衡（买方或卖方）
+            persistent_buy = all(im > bsettings.IMBALANCE_THRESHOLD for im in recent_imbalances)
+            persistent_sell = all(im < (1 - bsettings.IMBALANCE_THRESHOLD) for im in recent_imbalances)
+            imbalance_persistent = persistent_buy or persistent_sell
+        else:
+            imbalance_persistent = False
+
+        # 任一动力确认即 BAN
+        momentum_confirmed = delta_accelerating or sweep_confirmed or imbalance_persistent
+
+        return momentum_confirmed
+
+    # ==================== 辅助方法 ====================
+
+    def _determine_ban_direction(self, price: float, bands: Dict) -> DecisionType:
+        """
+        根据价格位置确定 BAN 方向
+
+        Args:
+            price: 当前价格
+            bands: 布林带数据
+
+        Returns:
+            DecisionType.BAN_SHORT (价格在上轨上方) 或 DecisionType.BAN_LONG (价格在下轨下方)
+        """
+        if price > bands['upper']:
+            return DecisionType.BAN_SHORT  # 禁止做空回归
+        elif price < bands['lower']:
+            return DecisionType.BAN_LONG  # 禁止做多回归
+        else:
+            return DecisionType.BAN_SHORT  # 默认
+
+    def apply_boost_to_confidence(
+        self,
+        base_confidence: float,
+        boost: float
+    ) -> float:
+        """
+        应用乘法增强到置信度（GPT 建议）
+
+        公式: new_confidence = min(100, base_confidence * (1 + boost))
+
+        Args:
+            base_confidence: 基础置信度 (0-100)
+            boost: 增强系数 (0.15 = +15%)
+
+        Returns:
+            增强后的置信度 (0-100)
+        """
+        new_confidence = base_confidence * (1 + boost)
+        return min(bsettings.MAX_CONFIDENCE, new_confidence)
+
+    def should_boost_for_stage(self, kgod_stage: str) -> bool:
+        """
+        判断是否允许在该 KGodRadar 阶段应用增强
+
+        Args:
+            kgod_stage: KGodRadar 信号阶段 ("PRE_ALERT" / "EARLY_CONFIRM" / "KGOD_CONFIRM" / "BAN")
+
+        Returns:
+            True 如果允许增强
+        """
+        return kgod_stage in bsettings.BOOST_ALLOWED_STAGES
+
+    def reset_acceptance_time(self):
+        """手动重置 acceptance_time（用于测试或特殊情况）"""
+        self.acceptance_time = 0.0
+        self.is_outside_band = False
+        self.grace_period_start = 0.0
 
     def get_stats(self) -> Dict:
         """获取统计信息"""
-        total = self.stats["total_evaluations"]
+        total = self.stats['total_evaluations']
         if total == 0:
             return self.stats
 
         return {
             **self.stats,
-            "allow_reversion_pct": self.stats["allow_reversion_count"] / total * 100,
-            "ban_reversion_pct": self.stats["ban_reversion_count"] / total * 100,
-            "no_trade_pct": self.stats["no_trade_count"] / total * 100,
-            "consecutive_losses": self.consecutive_losses,
-            "bb_data_points": len(self.bb.prices),
-            "bb_is_ready": self.bb.is_ready(),
+            'allow_pct': self.stats['allow_count'] / total * 100,
+            'ban_pct': self.stats['ban_count'] / total * 100,
+            'neutral_pct': self.stats['neutral_count'] / total * 100,
+            'current_state': self.current_state.value,
+            'acceptance_time': self.acceptance_time,
+            'bb_ready': self.bb.is_ready(),
         }
 
     def __repr__(self) -> str:
         return (
             f"BollingerRegimeFilter("
-            f"period={self.bb.period}, "
-            f"std_dev={self.bb.std_dev}, "
-            f"evaluations={self.stats['total_evaluations']})"
+            f"state={self.current_state.value}, "
+            f"acceptance_time={self.acceptance_time:.1f}s, "
+            f"evals={self.stats['total_evaluations']})"
         )
 
 
 # ==================== 测试代码 ====================
 
 if __name__ == "__main__":
-    print("="*60)
-    print("Bollinger Regime Filter - 测试")
-    print("="*60)
+    print("=" * 70)
+    print("布林带×订单流环境过滤器 - 单元测试")
+    print("=" * 70)
 
     # 创建过滤器
     filter_engine = BollingerRegimeFilter()
 
-    # 模拟价格序列（触上轨场景）
+    # 测试 1: 吸收型回归
+    print("\n[测试 1] 吸收型回归检测")
+    print("-" * 70)
+
+    # 模拟价格序列（逐渐上涨触上轨）
     import random
     base_price = 100.0
-    prices = []
-
-    # 前20个价格正常波动
-    for i in range(20):
-        prices.append(base_price + random.gauss(0, 0.5))
-
-    # 接下来价格上涨，触上轨
-    for i in range(10):
-        prices.append(base_price + 1.5 + i * 0.1 + random.gauss(0, 0.2))
-
-    print("\n测试 1: 回归信号检测（卖方冰山+失衡）")
-    print("-" * 60)
-
-    # 模拟冰山信号
-    from dataclasses import dataclass as dc
-
-    @dc
-    class MockIcebergSignal:
-        side: str
-        level: str
+    prices = [base_price + random.gauss(0, 0.3) for _ in range(20)]
+    prices += [base_price + 1.5 + i * 0.05 for i in range(10)]
 
     for i, price in enumerate(prices):
-        # 模拟订单流数据
-        delta_slope = random.gauss(0.2, 0.1) if i < 25 else -0.15  # 后期Delta转负
-        absorption = 0.3 if i < 25 else 0.6  # 后期吸收率高
-        imbalance = {"buy_ratio": 0.7, "sell_ratio": 0.3} if i < 25 else {"buy_ratio": 0.3, "sell_ratio": 0.7}
-
-        # 最后触上轨时出现卖方冰山
-        icebergs = []
-        if i >= 28:
-            icebergs = [MockIcebergSignal(side="SELL", level="CONFIRMED")]
-
-        result = filter_engine.evaluate(
-            price=price,
-            delta_slope=delta_slope,
-            absorption_ratio=absorption,
-            imbalance=imbalance,
-            iceberg_signals=icebergs
+        # 模拟订单流（后期吸收强 + Delta 背离）
+        flow = OrderFlowSnapshot(
+            delta_5s=100 if i < 25 else 20,
+            delta_slope_10s=0.5 if i < 25 else 0.1,  # Delta 衰减
+            imbalance_1s=0.7 if i < 25 else 0.4,
+            absorption_ask=2.0 if i < 25 else 3.0,  # 吸收增强
+            absorption_bid=2.0,
+            sweep_score_5s=1.0,
+            iceberg_intensity=0.5,
+            refill_count=1
         )
 
-        # 只打印关键时刻
-        if result.signal != RegimeSignal.NO_TRADE or i >= 28:
-            print(f"\n[{i+1:2d}] 价格: {price:.2f}")
-            if result.bands:
-                print(f"     上轨: {result.bands['upper']:.2f}, 中轨: {result.bands['middle']:.2f}")
-            print(f"     信号: {result.signal.value}")
-            print(f"     置信度: {result.confidence:.2%}")
-            print(f"     位置: {result.band_position}")
-            if result.triggers:
-                print(f"     触发: {', '.join(result.triggers)}")
-            if result.scenario:
-                print(f"     场景: {result.scenario}")
-            if result.reversion_score > 0:
-                print(f"     回归得分: {result.reversion_score:.2f}")
+        result = filter_engine.evaluate(price, flow, timestamp=i)
 
-    print("\n测试 2: 统计信息")
-    print("-" * 60)
+        # 打印关键结果
+        if result.decision != DecisionType.NEUTRAL or i >= 28:
+            print(f"\n[{i+1:2d}] 价格: {price:.2f} | 状态: {result.meta.get('state', 'N/A')}")
+            print(f"     决策: {result.decision.value} | 增强: +{result.confidence_boost*100:.0f}%")
+            if result.reasons:
+                print(f"     原因: {', '.join(result.reasons)}")
+            if 'scenario' in result.meta:
+                print(f"     场景: {result.meta['scenario']}")
+
+    print("\n" + "=" * 70)
+    print("✅ 测试完成！")
+    print("\n统计信息:")
     stats = filter_engine.get_stats()
     for key, value in stats.items():
         if isinstance(value, float):
             print(f"  {key}: {value:.2f}")
         else:
             print(f"  {key}: {value}")
-
-    print(f"\n✅ 测试完成！")

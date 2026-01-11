@@ -261,7 +261,10 @@ CONFIG_FEATURES = {
     "discord_enabled": False,                  # Discord 通知
     "web_dashboard_enabled": False,            # Web 仪表板
     "chain_analysis_enabled": False,           # 链上分析（待实现）
-    "use_p3_phase2": True,                     # P3-2 Phase 2 多信号综合判断（默认启用）
-    "use_bollinger_regime": False,             # 布林带环境过滤器（默认关闭，测试后启用）
-    "use_kgod_radar": False,                   # K神战法 2.0 雷达（Phase 2 集成，默认关闭）
+    "use_p3_phase2": False,                    # P3-2 Phase 2 多信号综合判断（暂时关闭，等待完整实现）
+    "use_kgod_radar": True,                    # K神战法 2.0 雷达（Phase 2 集成，已启用）
+
+    # 布林带×订单流环境过滤器（第三十五轮三方共识）
+    "use_bollinger_filter": True,              # 总开关（默认启用）
+    "bollinger_filter_mode": "observe",        # 模式: "observe" 只记录 | "enforce" 实际干预
 }
