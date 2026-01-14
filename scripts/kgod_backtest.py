@@ -66,12 +66,18 @@ class HistoricalDataLoader:
         Returns:
             事件列表（按时间戳排序）
         """
-        # 查找所有相关文件
-        pattern = f"{symbol}_*.jsonl.gz"
-        all_files = sorted(self.storage_dir.glob(pattern))
+        # 查找所有相关文件（支持两种命名格式：DOGE_USDT 和 DOGE-USDT）
+        pattern1 = f"{symbol}_*.jsonl.gz"
+        symbol_dash = symbol.replace('_', '-')
+        pattern2 = f"{symbol_dash}_*.jsonl.gz"
+
+        all_files = sorted(set(
+            list(self.storage_dir.glob(pattern1)) +
+            list(self.storage_dir.glob(pattern2))
+        ), key=lambda p: p.name)
 
         if not all_files:
-            raise FileNotFoundError(f"未找到 {symbol} 的历史数据文件")
+            raise FileNotFoundError(f"未找到 {symbol} 的历史数据文件（尝试了 {pattern1} 和 {pattern2}）")
 
         # 过滤日期范围
         target_files = self._filter_files_by_date(all_files, symbol, start_date, end_date)
@@ -103,15 +109,16 @@ class HistoricalDataLoader:
 
         filtered = []
         for file_path in files:
-            # 从文件名提取日期：DOGE_USDT_2026-01-09.jsonl.gz
-            # 先去掉所有后缀，得到基础名
-            base_name = file_path.name.replace('.jsonl.gz', '').replace('.jsonl', '')
-            parts = base_name.split('_')
-
-            if len(parts) < 3:
+            # 从文件名提取日期，支持两种格式：
+            # - DOGE_USDT_2026-01-09.jsonl.gz
+            # - DOGE-USDT_2026-01-12.jsonl.gz
+            # 使用正则表达式提取日期
+            import re
+            date_match = re.search(r'(\d{4}-\d{2}-\d{2})', file_path.name)
+            if not date_match:
                 continue
 
-            date_str = parts[2]  # "2026-01-09"
+            date_str = date_match.group(1)
 
             try:
                 file_dt = datetime.strptime(date_str, '%Y-%m-%d')
@@ -259,8 +266,307 @@ class KlineBuilder:
 
 
 # ==================== 信号提取模块 ====================
+# ==================== 事件重放模块 ====================
+class EventReplayer:
+    """
+    事件重放器 - 从历史数据重新生成 K神信号
+    
+    功能：
+    1. 按时间顺序处理 trades 和 orderbook 事件
+    2. 计算 CVD、OBI 等订单流指标
+    3. 构建 OrderFlowSnapshot 并调用 KGodRadar
+    4. 收集生成的信号
+    """
+    
+    def __init__(self, symbol: str = "DOGE/USDT"):
+        """
+        初始化事件重放器
+        
+        Args:
+            symbol: 交易对
+        """
+        self.symbol = symbol
+        
+        # 初始化 KGodRadar
+        from core.kgod_radar import create_kgod_radar, OrderFlowSnapshot
+        self.radar = create_kgod_radar(symbol)
+        self.OrderFlowSnapshot = OrderFlowSnapshot
+        
+        # 状态变量
+        self.cvd_total = 0.0
+        self.cvd_history = []
+        self.price_history = []
+        self.last_price = 0.0
+        self.last_obi = 0.0
+        
+        # 信号收集
+        self.signals = []
+        
+    def replay_events(self, events: List[Dict], 
+                      min_confidence: float = 0.0,
+                      progress_interval: int = 10000) -> List[Dict]:
+        """
+        重放事件并生成信号
+        
+        Args:
+            events: 事件列表（按时间排序）
+            min_confidence: 最低置信度过滤
+            progress_interval: 进度报告间隔
+            
+        Returns:
+            生成的信号列表
+        """
+        self.signals = []
+        total_events = len(events)
+        trades_count = 0
+        orderbook_count = 0
+        
+        print(f"开始重放 {total_events} 个事件...")
+        
+        for i, event in enumerate(events):
+            # 进度报告
+            if (i + 1) % progress_interval == 0:
+                print(f"  进度: {i+1}/{total_events} ({100*(i+1)/total_events:.1f}%)")
+            
+            event_type = event.get('type')
+            ts = event.get('ts', 0)
+            
+            if event_type == 'trades':
+                trades_count += 1
+                self._process_trades(event, ts)
+                
+            elif event_type == 'orderbook':
+                orderbook_count += 1
+                self._process_orderbook(event, ts)
+                
+                # 每次 orderbook 更新后尝试生成信号
+                if self.last_price > 0:
+                    signal = self._generate_signal(ts)
+                    if signal and signal.get('confidence', 0) >= min_confidence:
+                        self.signals.append(signal)
+        
+        print(f"\n重放完成: trades={trades_count}, orderbook={orderbook_count}")
+        print(f"生成 {len(self.signals)} 个信号（置信度>={min_confidence}）")
+        
+        return self.signals
+    
+    def _process_trades(self, event: Dict, ts: float):
+        """处理交易事件，更新 CVD"""
+        trades = event.get('data', [])
+        
+        for trade in trades:
+            price = trade.get('price', 0)
+            qty = trade.get('quantity', 0)
+            is_buyer_maker = trade.get('is_buyer_maker', False)
+            
+            # 更新价格
+            if price > 0:
+                self.last_price = price
+                self.price_history.append(price)
+                if len(self.price_history) > 100:
+                    self.price_history.pop(0)
+            
+            # 更新 CVD（买入为正，卖出为负）
+            if is_buyer_maker:
+                # 买方是 maker，说明卖方主动卖出
+                self.cvd_total -= qty * price
+            else:
+                # 卖方是 maker，说明买方主动买入
+                self.cvd_total += qty * price
+        
+        # 更新 CVD 历史
+        self.cvd_history.append(self.cvd_total)
+        if len(self.cvd_history) > 100:
+            self.cvd_history.pop(0)
+    
+    def _process_orderbook(self, event: Dict, ts: float):
+        """处理订单簿事件，计算 OBI"""
+        bids = event.get('bids', [])
+        asks = event.get('asks', [])
+        
+        # 计算买卖量
+        bid_volume = sum(b[1] for b in bids[:5]) if bids else 0
+        ask_volume = sum(a[1] for a in asks[:5]) if asks else 0
+        
+        # 计算 OBI（Order Book Imbalance）
+        total_volume = bid_volume + ask_volume
+        if total_volume > 0:
+            self.last_obi = (bid_volume - ask_volume) / total_volume  # 范围 [-1, 1]
+        else:
+            self.last_obi = 0.0
+    
+    def _generate_signal(self, ts: float) -> Optional[Dict]:
+        """生成 K神信号"""
+        if self.last_price <= 0:
+            return None
+        
+        # 计算 CVD Delta（最近5个点）
+        cvd_delta_5s = 0.0
+        if len(self.cvd_history) >= 5:
+            cvd_delta_5s = self.cvd_history[-1] - self.cvd_history[-5]
+        
+        # 计算 Delta 斜率
+        delta_slope_10s = 0.0
+        if len(self.cvd_history) >= 10:
+            recent_cvd = self.cvd_history[-10:]
+            n = len(recent_cvd)
+            x_mean = (n - 1) / 2
+            y_mean = sum(recent_cvd) / n
+            numerator = sum((i - x_mean) * (y - y_mean) for i, y in enumerate(recent_cvd))
+            denominator = sum((i - x_mean) ** 2 for i in range(n))
+            if denominator > 0:
+                delta_slope_10s = numerator / denominator
+        
+        # 构建 OrderFlowSnapshot（基于可用数据估算参数）
+        imbalance_1s = 0.5 + self.last_obi / 2  # OBI [-1,1] -> imbalance [0,1]
+        
+        # 估算吸收率（基于失衡）
+        absorption_ask = 0.5 + self.last_obi * 0.3 if self.last_obi > 0 else 0.5
+        absorption_bid = 0.5 - self.last_obi * 0.3 if self.last_obi < 0 else 0.5
+        
+        # 估算扫单得分（基于 CVD 变化强度）
+        sweep_score = 0.0
+        if len(self.cvd_history) >= 5:
+            cvd_change = abs(cvd_delta_5s)
+            # 标准化：假设 10000 USDT 的 CVD 变化对应 5 分
+            sweep_score = min(cvd_change / 2000, 10.0)
+        
+        # 估算冰山强度（基于 Delta 斜率和失衡的组合）
+        iceberg_intensity = 0.0
+        if abs(delta_slope_10s) > 100 and abs(self.last_obi) > 0.3:
+            # 强 Delta 斜率 + 强失衡 = 可能存在冰山
+            iceberg_intensity = min(abs(delta_slope_10s) / 500, 5.0)
+        
+        order_flow = self.OrderFlowSnapshot(
+            delta_5s=cvd_delta_5s,
+            delta_slope_10s=delta_slope_10s,
+            imbalance_1s=imbalance_1s,
+            absorption_ask=absorption_ask,
+            absorption_bid=absorption_bid,
+            sweep_score_5s=sweep_score,
+            iceberg_intensity=iceberg_intensity,
+            refill_count=int(iceberg_intensity),  # 估算补单次数
+            acceptance_above_upper_s=0.0,
+            acceptance_below_lower_s=0.0
+        )
+        
+        # 调用雷达
+        try:
+            signal = self.radar.update(self.last_price, order_flow, ts)
+            if signal:
+                return {
+                    'ts': signal.ts,
+                    'stage': signal.stage.value,
+                    'side': signal.side.value,
+                    'confidence': signal.confidence,
+                    'reasons': signal.reasons,
+                    'debug': signal.debug,
+                    'symbol': signal.symbol
+                }
+        except Exception as e:
+            pass
+        
+        return None
+
+
 class SignalExtractor:
     """从事件中提取 K神信号"""
+
+    @staticmethod
+    def load_signals_from_file(signals_dir: str = "storage/signals",
+                                start_date: Optional[str] = None,
+                                end_date: Optional[str] = None,
+                                min_confidence: float = 0.0) -> List[Dict]:
+        """
+        从信号文件加载 K神信号
+
+        Args:
+            signals_dir: 信号存储目录
+            start_date: 开始日期（YYYY-MM-DD）
+            end_date: 结束日期（YYYY-MM-DD）
+            min_confidence: 最低置信度过滤
+
+        Returns:
+            K神信号列表
+        """
+        import re
+        from datetime import datetime
+
+        signals_path = Path(signals_dir)
+        if not signals_path.exists():
+            print(f"信号目录不存在: {signals_dir}")
+            return []
+
+        # 加载所有 .jsonl 文件
+        signal_files = sorted(signals_path.glob("*.jsonl"))
+
+        # 日期过滤
+        start_dt = datetime.strptime(start_date, '%Y-%m-%d') if start_date else None
+        end_dt = datetime.strptime(end_date, '%Y-%m-%d') if end_date else None
+
+        filtered_files = []
+        for f in signal_files:
+            date_match = re.search(r'(\d{4}-\d{2}-\d{2})', f.name)
+            if date_match:
+                file_dt = datetime.strptime(date_match.group(1), '%Y-%m-%d')
+                if start_dt and file_dt < start_dt:
+                    continue
+                if end_dt and file_dt > end_dt:
+                    continue
+            filtered_files.append(f)
+
+        signals = []
+        for signal_file in filtered_files:
+            print(f"加载信号文件: {signal_file.name}")
+            try:
+                with open(signal_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        try:
+                            event = json.loads(line.strip())
+
+                            # 只处理 K神信号（k_god_buy 或 k_god_sell）
+                            signal_type = event.get('signal_type', '')
+                            if not signal_type.startswith('k_god'):
+                                continue
+
+                            # 提取数据
+                            data = event.get('data', {})
+                            confidence = event.get('confidence', 0.0)
+
+                            if confidence < min_confidence:
+                                continue
+
+                            # 从 timestamp 转换为 ts
+                            ts_str = event.get('timestamp', '')
+                            if ts_str:
+                                from datetime import datetime
+                                try:
+                                    dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                                    ts = dt.timestamp()
+                                except:
+                                    ts = 0
+                            else:
+                                ts = 0
+
+                            # 标准化信号
+                            signal = {
+                                'ts': ts,
+                                'stage': data.get('stage', 'UNKNOWN'),
+                                'side': 'BUY' if signal_type == 'k_god_buy' else 'SELL',
+                                'confidence': confidence,
+                                'reasons': [],
+                                'debug': data,
+                                'symbol': event.get('symbol', 'UNKNOWN')
+                            }
+                            signals.append(signal)
+
+                        except json.JSONDecodeError:
+                            continue
+            except Exception as e:
+                print(f"加载失败 {signal_file.name}: {e}")
+
+        print(f"从信号文件加载到 {len(signals)} 个 K神信号")
+        return signals
 
     @staticmethod
     def extract_kgod_signals(events: List[Dict], min_confidence: float = 0.0) -> List[Dict]:
@@ -949,15 +1255,25 @@ class KGodBacktest:
         self.klines = self.kline_builder.build_klines(prices, self.timeframe)
         print(f"聚合得到 {len(self.klines)} 根 K 线")
 
-    def run_signal_outcome_eval(self):
+    def run_signal_outcome_eval(self, start_date: Optional[str] = None, end_date: Optional[str] = None):
         """Mode 2: 信号结果评估"""
         print("\n=== 运行信号结果评估 ===")
 
-        # 1. 提取 KGOD 信号
+        # 1. 提取 KGOD 信号（先从事件文件，再从信号文件）
         min_confidence = self.config.get('min_confidence', 0.0)
         self.kgod_signals = self.signal_extractor.extract_kgod_signals(
             self.events, min_confidence
         )
+
+        # 如果事件文件中没有信号，尝试从信号文件加载
+        if not self.kgod_signals:
+            print("事件文件中无 KGOD 信号，尝试从信号文件加载...")
+            self.kgod_signals = self.signal_extractor.load_signals_from_file(
+                signals_dir="storage/signals",
+                start_date=start_date,
+                end_date=end_date,
+                min_confidence=min_confidence
+            )
 
         if not self.kgod_signals:
             print("未找到符合条件的 KGOD 信号")
@@ -977,10 +1293,36 @@ class KGodBacktest:
         print(f"评估完成: {len(self.results)} 个结果")
 
     def run_full_replay(self):
-        """Mode 1: 完整回放（可选）"""
+        """Mode 1: 完整回放 - 从历史数据重新生成 K神信号"""
         print("\n=== 运行完整回放模式 ===")
-        print("此模式尚未实现（需要重新运行 KGodRadar.update）")
-        print("建议使用 signal_outcome_eval 模式")
+
+        # 1. 初始化事件重放器
+        replayer = EventReplayer(self.symbol)
+        min_confidence = self.config.get('min_confidence', 0.0)
+
+        # 2. 重放事件生成信号
+        self.kgod_signals = replayer.replay_events(
+            self.events,
+            min_confidence=min_confidence,
+            progress_interval=50000
+        )
+
+        if not self.kgod_signals:
+            print("未生成任何符合条件的 KGOD 信号")
+            return
+
+        # 3. 评估信号
+        print(f"\n开始评估 {len(self.kgod_signals)} 个信号...")
+        self.results = []
+
+        for i, signal in enumerate(self.kgod_signals):
+            if (i + 1) % 50 == 0:
+                print(f"  进度: {i+1}/{len(self.kgod_signals)}")
+
+            result = self.evaluator.evaluate_signal(signal, self.klines)
+            self.results.append(result)
+
+        print(f"评估完成: {len(self.results)} 个结果")
 
     def generate_reports(self):
         """生成 CSV 和摘要报告"""
@@ -1132,7 +1474,7 @@ def main():
 
         # 运行回测
         if args.mode == 'signal_outcome_eval':
-            backtest.run_signal_outcome_eval()
+            backtest.run_signal_outcome_eval(args.start_date, args.end_date)
         else:
             backtest.run_full_replay()
 

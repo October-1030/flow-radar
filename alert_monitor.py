@@ -54,6 +54,7 @@ from core.websocket_manager import WebSocketManager, load_websocket_config
 from core.discord_notifier import DiscordNotifier, AlertMessage
 from core.price_level import PriceLevel, IcebergLevel, CONFIG_PRICE_LEVEL
 from core.run_metadata import RunMetadataRecorder
+from core.signal_output import signal_output  # Signal Commander 联调
 
 # P3-2 Phase 2: Multi-signal judgment system
 if CONFIG_FEATURES.get("use_p3_phase2", False):
@@ -991,6 +992,24 @@ class AlertMonitor:
             }
             self.event_logger.log_iceberg(iceberg_data, signal.timestamp.timestamp())
 
+        # Signal Commander 联调：输出信号到专用文件
+        try:
+            level_name = signal.level.name if hasattr(signal.level, 'name') else str(signal.level)
+            signal_output.emit_iceberg_detected(
+                symbol=self.symbol,
+                side=signal.side,
+                price=signal.price,
+                intensity=signal.intensity,
+                cumulative_volume=signal.cumulative_volume,
+                visible_depth=signal.visible_depth,
+                refill_count=signal.refill_count,
+                level=level_name,
+                confidence=signal.confidence,
+            )
+        except Exception as e:
+            # 不影响主流程
+            pass
+
     def _update_kgod_radar(self, price: float, indicators, event_ts: float):
         """
         K神战法 2.0 雷达更新（简化版 OrderFlowSnapshot 构建）
@@ -1116,6 +1135,34 @@ class AlertMonitor:
                 self._format_kgod_message(signal),
                 alert_level
             )
+
+        # Signal Commander 联调：输出 K神信号到专用文件
+        # 只输出 KGOD_CONFIRM 和 EARLY_CONFIRM（BAN 不是交易信号）
+        if signal.stage in (SignalStage.KGOD_CONFIRM, SignalStage.EARLY_CONFIRM):
+            try:
+                extra_data = {
+                    "stage": signal.stage.name,
+                    "reasons": signal.reasons[:3] if signal.reasons else [],
+                }
+                if signal.side.value == "BUY":
+                    signal_output.emit_k_god_buy(
+                        symbol=self.symbol,
+                        price=self.current_price,
+                        score=signal.confidence,
+                        confidence=signal.confidence,
+                        extra_data=extra_data,
+                    )
+                else:
+                    signal_output.emit_k_god_sell(
+                        symbol=self.symbol,
+                        price=self.current_price,
+                        score=signal.confidence,
+                        confidence=signal.confidence,
+                        extra_data=extra_data,
+                    )
+            except Exception as e:
+                # 不影响主流程
+                pass
 
     def _apply_bollinger_filter(self, kgod_signal: 'KGodSignal',
                                 order_flow: 'OrderFlowSnapshot',
